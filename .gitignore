@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+# venv
+venv/
+.venv/
+env/
+# django
+db.sqlite3
+/staticfiles/
+/media/
+# env
+.env
+.env.*
+!.env.example
+# os / editor
+.DS_Store
+.vscode/
+*.log
