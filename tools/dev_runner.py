@@ -84,7 +84,16 @@ WEB_LOG = LOG_DIR / 'launcher-web.log'
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-MIN_PYTHON = (3, 10)
+# Django 6.0 (pinned in requirements.txt) declares ``Requires-Python
+# >=3.12``. CI proved this is a hard install-time floor, not a suggestion:
+# on Python 3.11 `pip install -r requirements.txt` cannot even resolve it
+# ("Could not find a version that satisfies the requirement Django==6.0.6"
+# / "No matching distribution found for Django==6.0.6") — there is no
+# friendlier failure mode below 3.12. Keep this in sync with the `test`
+# job's python-version matrix in .github/workflows/ci.yml and with
+# check_python_floor() below, which turns a violation of this floor into an
+# actionable preflight failure instead of that confusing pip error.
+MIN_PYTHON = (3, 12)
 MIN_NODE_MAJOR = 18
 MIN_FREE_DISK_MB = 2048
 
@@ -111,12 +120,25 @@ DEFAULT_CREDENTIALS = {
     'admin': {'email': 'admin@autosmokeguard.local', 'password': 'Admin@12345'},
 }
 
+# Deliberately ordered, not alphabetical/numeric: 3.13 first because it is
+# the newer of the two versions exercised by CI (see ci.yml's `test` job
+# matrix) and matches the primary supported target; 3.12 next because it is
+# MIN_PYTHON, the floor Django 6.0 requires; 3.14 after that as a
+# forward-compatible fallback (newest CPython, not yet in the CI matrix);
+# the unversioned `python3`/`python` names last because they could resolve
+# to literally anything the platform ships under that name. 3.11 is
+# deliberately ABSENT — Django 6.0 requires >=3.12, so offering an
+# interpreter below that floor here would just relocate today's confusing
+# pip resolver error a few minutes later instead of avoiding it. Do not add
+# it back; see MIN_PYTHON and check_python_floor() above/below.
 PYTHON_CANDIDATES = (
-    'python3.13', 'python3.12', 'python3.11', 'python3.14', 'python3', 'python',
+    'python3.13', 'python3.12', 'python3.14', 'python3', 'python',
 )
 # The Windows ``py`` launcher understands version selectors that are not on
-# PATH as standalone executables, so it gets its own probe list.
-PY_LAUNCHER_ARGS = ('-3.13', '-3.12', '-3.11', '-3.14', '-3')
+# PATH as standalone executables, so it gets its own probe list. Same
+# ordering rationale as PYTHON_CANDIDATES; 3.11 is absent for the same
+# reason.
+PY_LAUNCHER_ARGS = ('-3.13', '-3.12', '-3.14', '-3')
 
 VERSION_PROBE = 'import sys;print(sys.version_info[:2])'
 USER_AGENT = 'AutoSmokeGuard-launcher/1.0'
@@ -411,6 +433,60 @@ def probe_python(cmd, timeout=25):
     return int(match.group(1)), int(match.group(2))
 
 
+def check_python_floor(version, description, *, is_existing_venv=False):
+    """Raise :class:`LauncherError` when *version* is below :data:`MIN_PYTHON`.
+
+    This is the explicit, preflight-time gate that stops a too-old
+    interpreter *before* it ever reaches ``pip install -r requirements.txt``.
+    Django 6.0 (pinned in requirements.txt) declares ``Requires-Python
+    >=3.12``; CI proved this is a hard floor, not a suggestion — on Python
+    3.11 pip cannot even resolve the dependency ("Could not find a version
+    that satisfies the requirement Django==6.0.6"), and that resolver error
+    gives no hint that the interpreter itself is the actual problem. Calling
+    this up front turns that opaque, minutes-later failure into one clear,
+    actionable message naming the interpreter that was found, the floor it
+    missed, and why.
+
+    Called from two places:
+      * :func:`find_python`, for a *pre-existing* ``backend/.venv`` — an old
+        venv is not something this launcher rebuilds automatically (nothing
+        else deletes it for the user), so the fix here is to say so and tell
+        the user to delete it, rather than silently limping on with it.
+      * :meth:`Launcher.phase_preflight`, as a final defensive check on
+        whatever :func:`find_python` ultimately selected — including a bare
+        ``python3``/``python``, which could resolve to anything on a given
+        machine.
+
+    *version* may be ``None`` (interpreter could not be probed at all); that
+    also fails the floor check.
+    """
+    if version is not None and version >= MIN_PYTHON:
+        return
+    found = ('%d.%d' % version) if version else 'unknown'
+    want = '%d.%d' % MIN_PYTHON
+    if is_existing_venv:
+        raise LauncherError(
+            '%s was built with Python %s, older than the required %s+' % (
+                rel(VENV_DIR), found, want),
+            detail='Django 6.0 (pinned in backend/requirements.txt) requires '
+                   'Python >= 3.12. A virtualenv built with an older '
+                   'interpreter cannot install it, and would fail later with '
+                   'a confusing pip resolver error instead of this message.',
+            hint='Delete %s and re-run this launcher so it rebuilds the '
+                 'virtualenv with a supported interpreter (%s+).' % (
+                     rel(VENV_DIR), want),
+        )
+    raise LauncherError(
+        '%s is Python %s, older than the required %s+' % (description, found, want),
+        detail='Django 6.0 (pinned in backend/requirements.txt) declares '
+               'Requires-Python >= 3.12. Python %s cannot install this '
+               'project at all — pip would fail with "Could not find a '
+               'version that satisfies the requirement Django==6.0.6".' % found,
+        hint='Install Python %s+ from %s and make sure it is the interpreter '
+             'PATH resolves to, then re-run.' % (want, PYTHON_DOWNLOAD_URL),
+    )
+
+
 def find_python(venv_python=None, is_windows=None, verbose=False):
     """Locate an interpreter good enough to build the backend venv.
 
@@ -418,6 +494,12 @@ def find_python(venv_python=None, is_windows=None, verbose=False):
     (newest-but-proven first), then the bare names, then the Windows ``py``
     launcher, then whatever is running this script.  Returns
     ``(argv_list, (major, minor), description)``.
+
+    Every candidate is checked against :data:`MIN_PYTHON` (Django 6.0's
+    floor) via :func:`check_python_floor` before it can be selected, so this
+    function never returns an interpreter below that floor — a pre-existing
+    ``backend/.venv`` built with a too-old interpreter fails loudly here
+    instead of being silently reused later.
     """
     if is_windows is None:
         is_windows = platform.system() == 'Windows'
@@ -426,10 +508,12 @@ def find_python(venv_python=None, is_windows=None, verbose=False):
 
     if venv_python is not None and Path(venv_python).exists():
         version = probe_python([str(venv_python)])
-        if version and version >= MIN_PYTHON:
+        if version:
+            check_python_floor(version, 'existing project virtualenv',
+                                is_existing_venv=True)
             return [str(venv_python)], version, 'existing project virtualenv'
-        tried.append('%s (existing venv, %s)' % (
-            rel(venv_python), 'unusable' if not version else '%d.%d' % version))
+        tried.append('%s (existing venv, unusable — could not run it)'
+                     % rel(venv_python))
 
     for name in PYTHON_CANDIDATES:
         found = shutil.which(name)
@@ -472,7 +556,9 @@ def find_python(venv_python=None, is_windows=None, verbose=False):
                'python3.12-venv' % PYTHON_DOWNLOAD_URL)
     raise LauncherError(
         'no Python >= %s found on this machine' % want,
-        detail='Tried:\n  - ' + '\n  - '.join(tried),
+        detail='Django 6.0 (pinned in backend/requirements.txt) requires '
+               'Python >= 3.12; this project cannot install on anything '
+               'older.\nTried:\n  - ' + '\n  - '.join(tried),
         hint=fix,
     )
 
@@ -1169,6 +1255,13 @@ class Launcher:
         # --- interpreter for the backend venv ---
         self.host_python, self.host_python_version, source = find_python(
             self.venv_python, self.profile.is_windows, self.verbose)
+        # Defense in depth: find_python() already filters every candidate
+        # against MIN_PYTHON internally, so this should never actually fire
+        # — but the whole point of a *preflight* floor check is that it is
+        # not allowed to depend on nobody ever changing that internal
+        # filter. This is the line that turns a stray regression into a
+        # clear failure here rather than an opaque pip error minutes later.
+        check_python_floor(self.host_python_version, source)
         info('%-12s %s  (%d.%d, from %s)' % (
             'python:', format_cmd(self.host_python),
             self.host_python_version[0], self.host_python_version[1], source))
