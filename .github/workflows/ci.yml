@@ -26,7 +26,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python-version: ["3.11", "3.12"]
+        # Floor is 3.12, not a style choice: Django 6.0 (pinned in
+        # requirements.txt) declares Requires-Python >=3.12, so 3.11 cannot
+        # even resolve `pip install -r requirements.txt` ("Could not find a
+        # version that satisfies the requirement Django==6.0.6"). Do not
+        # "helpfully" add 3.11 back here — it will fail on every leg, not
+        # just this one. 3.13 is kept alongside the floor so the matrix still
+        # has more than one version and catches newer-Python breakage early.
+        python-version: ["3.12", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
