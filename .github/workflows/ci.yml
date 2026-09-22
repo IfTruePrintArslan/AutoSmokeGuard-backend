@@ -3,8 +3,12 @@ name: Backend CI
 # backend/ is its own git repository, so this workflow's checkout root IS the
 # repo root (manage.py, requirements.txt, Dockerfile all live at ".").
 on:
+  # No branch filter: this project develops on feature branches
+  # (feat/full-system-implementation, etc.), not just main/dev/staging, and a
+  # push-triggered workflow that only listens on those three branches simply
+  # never runs during normal development. Every push, on every branch, runs
+  # CI; the branch list below still gives main/dev/staging their PR gate.
   push:
-    branches: [main, dev, staging]
   pull_request:
     branches: [main, dev, staging]
 
@@ -16,11 +20,12 @@ env:
 
 jobs:
   test:
-    name: test (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.11", "3.12"]
 
     steps:
@@ -41,6 +46,14 @@ jobs:
         # runner that's not just slow, the runner's fixed-size disk can
         # genuinely fill up and fail the job outright once torch, torchvision,
         # ultralytics, and opencv are all in the mix.
+        #
+        # shell: bash — the trailing "\" below is a POSIX line continuation.
+        # On windows-latest the default shell is PowerShell, where "\" is not
+        # a continuation character (it would be parsed as part of the next
+        # token and break the command). GitHub-hosted Windows runners ship
+        # Git's bash, so pinning the shell here is enough; the command itself
+        # needs no other change.
+        shell: bash
         run: |
           pip install torch==2.14.0 torchvision==0.29.0 \
             --index-url https://download.pytorch.org/whl/cpu
@@ -65,7 +78,13 @@ jobs:
         # --fail-on-warn turns schema-generation warnings (e.g. an
         # unresolvable serializer field) into a build failure instead of a
         # silently degraded docs page.
-        run: python manage.py spectacular --fail-on-warn --file /tmp/schema.yml
+        #
+        # File written under ${{ runner.temp }} rather than /tmp: /tmp does
+        # not exist on windows-latest runners, whereas runner.temp is an
+        # OS-appropriate temp directory GitHub Actions guarantees on every
+        # platform (it resolves to D:\...\Temp on Windows, /tmp-equivalent
+        # elsewhere).
+        run: python manage.py spectacular --fail-on-warn --file "${{ runner.temp }}/schema.yml"
 
       - name: Compile check (ruff-free lint)
         # This project does not use ruff; compileall is the cheap, dependency
@@ -74,6 +93,13 @@ jobs:
 
   docker:
     name: docker build + healthcheck
+    # Pinned to ubuntu-latest regardless of the test matrix above: the
+    # project's Dockerfile builds a Linux image (apt-get base layer, a
+    # POSIX shell ENTRYPOINT) and cannot build on a Windows runner. `needs:
+    # test` still waits for *every* leg of the test matrix — both operating
+    # systems and both Python versions — to succeed before this job starts,
+    # matrix jobs share a single job id (`test`) regardless of how many
+    # legs they expand into.
     runs-on: ubuntu-latest
     needs: test
     steps:
@@ -89,6 +115,10 @@ jobs:
         run: docker run -d --name asg-backend-ci -p 8000:8000 asg-backend:ci
 
       - name: Wait for container healthcheck to pass
+        # ubuntu-latest only (see runs-on above), so the POSIX-isms here
+        # ($(seq ...), sleep, [ ... ]) run under the runner's default bash
+        # without needing an explicit `shell:` — unlike the matrixed `test`
+        # job, this step never executes on a Windows runner.
         run: |
           for i in $(seq 1 30); do
             status="$(docker inspect --format='{{.State.Health.Status}}' asg-backend-ci)"
@@ -109,3 +139,147 @@ jobs:
       - name: Clean up
         if: always()
         run: docker rm -f asg-backend-ci || true
+
+  launcher-smoke-test:
+    name: launcher smoke test (dev_runner.py, ${{ matrix.os }})
+    # The whole point of this job: tools/dev_runner.py (the real
+    # implementation behind FYP/start.py) has OS-conditional branches —
+    # Windows venv Scripts\ layout, npm.cmd resolution, CREATE_NEW_PROCESS_
+    # GROUP, VT console init, the port probe's Windows socket semantics —
+    # that an ubuntu-only CI has never executed. windows-latest and
+    # macos-latest runners execute the real code for real here, not just an
+    # import.
+    #
+    # This workflow's checkout root is the *backend* repo only (see the note
+    # at the top of this file); there is no sibling frontend/ checkout, so
+    # REPO_ROOT/frontend (as dev_runner.py computes it, three parents above
+    # tools/dev_runner.py) does not exist in this checkout. That is why
+    # every invocation below passes --backend-only — without it,
+    # phase_preflight fails immediately on a missing frontend/package.json.
+    # Node/npm detection in preflight (including the real npm.cmd
+    # resolution on Windows) still runs unconditionally either way, so that
+    # coverage is not lost.
+    #
+    # What this job genuinely exercises (real, non-simulated code paths):
+    #   - preflight: interpreter discovery (find_python), node/npm
+    #     detection and `npm --version` via the real Windows npm.cmd
+    #     resolution, the disk-space check, VT console init
+    #     (configure_console runs unconditionally before any phase)
+    #   - venv path construction (OSProfile.venv_python -> ...\Scripts\
+    #     python.exe on Windows / .../bin/python elsewhere) and real pip /
+    #     manage.py / pytest subprocess invocations made *through* that
+    #     resolved interpreter
+    #   - manage.py migrate + tools/seed.py, and the pytest suite, run via
+    #     the real per-OS venv python
+    #   - the --simulate-os windows/darwin dry-run report itself: on
+    #     windows-latest, --simulate-os windows has the same OS name as the
+    #     host, so npm_display() and the port probe fall through to their
+    #     *real* implementations (real npm.cmd lookup, a real
+    #     socket.bind() using Windows' non-SO_REUSEADDR semantics) rather
+    #     than the synthetic "what would happen on another OS" text.
+    #
+    # What it does NOT cover, even with a Windows/macOS runner (documented
+    # here rather than silently dropped):
+    #   - phase_ml_assets (YOLO weight download + smoke U-Net training) is
+    #     skipped with --skip-ml. There is no CPU-wheel-style shortcut for
+    #     this phase: a real run risks an extra network dependency on a
+    #     GitHub release download plus a training step the launcher itself
+    #     allows up to 4 hours for. That is unreasonable for a CI smoke
+    #     test, so --skip-ml (a real, documented launcher flag) is used
+    #     instead of forcing it through.
+    #   - phase_sample_media would then hard-fail: tools/make_samples.py
+    #     requires the YOLO weights that --skip-ml just omitted, and raises
+    #     RuntimeError without them. This job pre-seeds sample_media/ with a
+    #     placeholder file so the launcher takes its own documented
+    #     "sample media already generated" skip path instead of failing on
+    #     a condition this job deliberately created.
+    #   - phase_start_servers — and therefore CREATE_NEW_PROCESS_GROUP, the
+    #     real Django/Vite child process spawn, and the live port probe in
+    #     _resolve_ports — is never reached: --check intentionally stops the
+    #     plan right after the test-suite phase, before servers start. The
+    #     Windows CREATE_NEW_PROCESS_GROUP branch and the taskkill-based
+    #     shutdown path remain untested by any job in this file.
+    #   - phase_frontend_deps (a real `npm ci`) is skipped by --backend-only
+    #     for the REPO_ROOT reason above; only the npm binary *resolution*
+    #     (not an actual install) is covered here — the frontend build job
+    #     in frontend/.github/workflows/ci.yml is what exercises npm ci for
+    #     real on Windows.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Same rationale as the `test` job above: no live background worker
+      # thread in CI.
+      ASG_WORKER_ENABLED: "False"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Set up Node 22
+        # Only needed so phase_preflight's node/npm detection (including the
+        # real npm.cmd resolution on Windows) has a real toolchain to find;
+        # --backend-only below means npm is never actually invoked to
+        # install or run anything in this job.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Create the launcher's own backend virtualenv (CPU torch)
+        # dev_runner.py's phase_backend_venv builds backend/.venv itself and
+        # then runs a plain `pip install -r requirements.txt` with no index
+        # override — on a from-scratch venv that pulls the full CUDA torch
+        # wheel, exactly the disk-space risk the `test` job's CPU-wheel step
+        # above avoids (see that step's comment). Pre-creating the venv here
+        # and installing CPU torch into *that exact venv* first means the
+        # later real `pip install -r requirements.txt` (run for real by
+        # dev_runner.py itself, further down) finds torch/torchvision
+        # already satisfied at the pinned version and skips re-downloading
+        # them — same trick as the `test` job, just targeted at the venv the
+        # launcher will actually use instead of the job's ambient Python.
+        #
+        # shell: bash for the "\" line continuation, same reasoning as the
+        # `test` job's CPU-torch step; the Scripts/ vs bin/ layout is
+        # resolved at runtime rather than hard-coded per OS.
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [ -f .venv/Scripts/python.exe ]; then
+            VENV_PY=.venv/Scripts/python.exe
+          else
+            VENV_PY=.venv/bin/python
+          fi
+          "$VENV_PY" -m pip install --upgrade pip
+          "$VENV_PY" -m pip install torch==2.14.0 torchvision==0.29.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Pre-seed sample_media/ (skip-ml means make_samples.py can't run)
+        # See the job-level comment above: tools/make_samples.py hard-
+        # requires the YOLO weights that --skip-ml intentionally omits.
+        # phase_sample_media skips generation outright when the directory
+        # already contains a file, so a placeholder is enough.
+        shell: bash
+        run: |
+          mkdir -p sample_media
+          echo "placeholder for launcher-smoke-test (see ci.yml)" > sample_media/ci-placeholder.txt
+
+      - name: Launcher dry run report — simulate Windows
+        # See the job-level comment: on windows-latest this exercises real
+        # npm.cmd resolution and a real port probe, not just synthetic text.
+        run: python tools/dev_runner.py --check --simulate-os windows --no-browser
+
+      - name: Launcher dry run report — simulate macOS
+        run: python tools/dev_runner.py --check --simulate-os darwin --no-browser
+
+      - name: Launcher genuine run (--check --backend-only --skip-ml)
+        # The valuable step: no --simulate-os, so this is the launcher's
+        # real, non-simulated code path on the real OS. See the job-level
+        # comment for exactly which phases this does and does not cover.
+        run: python tools/dev_runner.py --check --backend-only --skip-ml --no-browser
