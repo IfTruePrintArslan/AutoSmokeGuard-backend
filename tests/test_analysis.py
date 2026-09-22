@@ -37,6 +37,11 @@ from django.utils import timezone
 
 from analysis import services, worker
 from analysis.models import (
+    REPORT_FAILED,
+    REPORT_GENERATING,
+    REPORT_PENDING,
+    REPORT_READY,
+    REPORT_SKIPPED,
     STATUS_DONE,
     STATUS_FAILED,
     STATUS_QUEUED,
@@ -357,7 +362,11 @@ def test_analyze_translates_snapshot_keys_for_mlcore(auth_client, media,
 
     config = fake_mlcore.pipeline.calls[0]['config']
     assert config.kwargs['conf_threshold'] == pytest.approx(0.5)
-    assert config.kwargs['mask_threshold'] == pytest.approx(0.2)
+    # sensitivity 80 -> 0.25 + 0.80 * 0.50. Ascending: a higher slider is a
+    # stricter run (review finding F21). This expectation was 0.2 under the
+    # old inverted mapping; the assertion is unchanged in kind, only in the
+    # value the corrected mapping produces.
+    assert config.kwargs['mask_threshold'] == pytest.approx(0.65)
     assert 'confidence_threshold' not in config.kwargs
     assert 'smoke_mask_threshold' not in config.kwargs
 
@@ -771,6 +780,133 @@ def test_report_failure_never_fails_the_analysis(auth_client, media,
 
 
 # ---------------------------------------------------------------------------
+# report_status — what the worker records about the PDF
+#
+# `status` alone cannot answer "is a report still coming?".  A `done` analysis
+# with `report: null` is either one whose PDF is being written this instant or
+# one whose PDF died in the first two seconds, and the client used to tell
+# them apart by waiting out the server's whole 30-second render budget.  These
+# tests pin the worker's side of the replacement: every path through
+# `_maybe_generate_report` leaves a state the client can act on, and the
+# failure path leaves `failed` rather than an abandoned `generating`.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.django_db
+def test_worker_records_ready_once_the_pdf_is_actually_written(
+        auth_client, media, fake_mlcore):
+    """The happy path, end to end: a real PDF and a row that says so."""
+    response = analyze(auth_client, media, auto_generate_pdf=True)
+
+    analysis_id = response.json()['analysis_id']
+    analysis = AnalysisResult.objects.get(pk=analysis_id)
+    assert analysis.status == STATUS_DONE
+    assert analysis.report_status == REPORT_READY
+
+    body = auth_client.get(
+        reverse('analysis-detail', args=[analysis_id])).json()
+    assert body['report_status'] == REPORT_READY
+    # 'ready' is a promise about the same payload: the report is right there.
+    assert body['report'] is not None
+
+
+@pytest.mark.django_db
+def test_a_swallowed_report_failure_is_still_recorded_as_failed(
+        auth_client, media, fake_mlcore, monkeypatch):
+    """
+    The hook swallows the exception; it must not swallow the *fact* of it.
+
+    This is the defect the field exists for.  `_maybe_generate_report` catches
+    everything by design — a bad render must never fail a good analysis — and
+    the cost used to be that the failure became invisible: the row looked
+    exactly like one whose report was still being written, so the results
+    screen sat on a disabled "Preparing report…" for the remaining twenty-odd
+    seconds of a budget nothing was spending.
+
+    Note where the failure is injected.  Replacing the whole `reports.services`
+    module means the seam's own bookkeeping never runs — the import is inside
+    the worker's `try` — so this also pins the worker's belt-and-braces stamp
+    rather than the reports app's.
+    """
+    def explode(analysis):
+        raise RuntimeError('reportlab fell over')
+
+    fake_reports = types.ModuleType('reports.services')
+    fake_reports.generate_report_for_analysis = explode
+    monkeypatch.setitem(sys.modules, 'reports.services', fake_reports)
+
+    response = analyze(auth_client, media, auto_generate_pdf=True)
+    analysis_id = response.json()['analysis_id']
+
+    analysis = AnalysisResult.objects.get(pk=analysis_id)
+    assert analysis.status == STATUS_DONE, 'the analysis itself must survive'
+    assert analysis.report_status == REPORT_FAILED, (
+        f'a report generation that raised left report_status='
+        f'{analysis.report_status!r}; a client cannot distinguish that from '
+        'a render still in progress'
+    )
+    assert analysis.report_status != REPORT_GENERATING
+
+    # And the client actually gets to see it — this is the whole delivery
+    # path: worker -> column -> serializer -> the screen that was guessing.
+    body = auth_client.get(
+        reverse('analysis-detail', args=[analysis_id])).json()
+    assert body['report_status'] == REPORT_FAILED
+    assert body['report'] is None
+
+
+@pytest.mark.django_db
+def test_auto_pdf_off_is_recorded_as_skipped_not_left_pending(
+        auth_client, media, fake_mlcore):
+    """A run that never asked for a PDF says so, instead of staying silent."""
+    response = analyze(auth_client, media, auto_generate_pdf=False)
+
+    analysis = AnalysisResult.objects.get(pk=response.json()['analysis_id'])
+    assert analysis.status == STATUS_DONE
+    assert analysis.report_status == REPORT_SKIPPED
+
+
+@pytest.mark.django_db
+def test_a_failed_analysis_stops_promising_a_report(auth_client, media,
+                                                    fake_mlcore):
+    """
+    A crashed run never reaches the report hook, so the row must be resolved
+    where it *is* failed — otherwise `report_status` keeps its `pending`
+    default and advertises a PDF that nothing will ever render (the report
+    endpoint refuses any analysis that is not `done`).
+    """
+    fake_mlcore.analyze_media = FakePipeline(raises=RuntimeError('boom'))
+
+    response = analyze(auth_client, media, auto_generate_pdf=True)
+
+    analysis = AnalysisResult.objects.get(pk=response.json()['analysis_id'])
+    assert analysis.status == STATUS_FAILED
+    assert analysis.report_status == REPORT_SKIPPED
+    assert analysis.report_status != REPORT_PENDING
+
+
+@pytest.mark.django_db
+def test_detail_reports_ready_for_a_row_that_predates_the_column(
+        auth_client, media, fake_mlcore):
+    """
+    A stored value the evidence contradicts is reconciled, not repeated.
+
+    Rows written by a build without this field carry the `pending` default
+    beside a perfectly good PDF; describing those as "not started" would be a
+    fresh untruth in the very field added to stop one.
+    """
+    analysis_id = analyze(auth_client, media,
+                          auto_generate_pdf=True).json()['analysis_id']
+    AnalysisResult.objects.filter(pk=analysis_id).update(
+        report_status=REPORT_PENDING)
+
+    body = auth_client.get(
+        reverse('analysis-detail', args=[analysis_id])).json()
+
+    assert body['report'] is not None
+    assert body['report_status'] == REPORT_READY
+
+
+# ---------------------------------------------------------------------------
 # Severity re-banding
 # ---------------------------------------------------------------------------
 
@@ -899,6 +1035,12 @@ def test_restart_recovery_fails_orphaned_jobs(auth_client, media_factory):
     assert queued.status == STATUS_FAILED
     assert finished.status == STATUS_DONE
 
+    # A run that was interrupted is never getting a PDF: the report endpoint
+    # refuses anything that is not 'done'. Leaving report_status on its
+    # 'pending' default would have the row promising one forever.
+    assert running.report_status == REPORT_SKIPPED
+    assert queued.report_status == REPORT_SKIPPED
+
 
 def test_bootstrap_is_suppressed_under_pytest():
     """The boot thread must never fire inside the test suite."""
@@ -940,8 +1082,12 @@ def test_detail_matches_the_contract_shape(auth_client, media, settings_row,
         'total_smoke', 'avg_confidence', 'overall_severity',
         'severity_counts', 'preview_url', 'report', 'settings_snapshot',
         'frames_processed', 'error_message', 'annotated_frames', 'vehicles',
-        'segmenter_mode', 'device',
+        'segmenter_mode', 'device', 'report_status',
     }
+    # With auto-PDF pinned off above, 'no report is coming' is the *only*
+    # possible answer here — and the payload has to say so rather than leave
+    # the client to work it out from `report: null` plus a stopwatch.
+    assert body['report_status'] == REPORT_SKIPPED
     assert set(body['media']) == {'media_id', 'filename', 'media_type', 'url'}
     assert body['media']['url'].startswith('/media/uploads/')
     assert body['preview_url'] == f'/media/analyses/{job_id}/preview.jpg'
@@ -1069,31 +1215,61 @@ def test_report_for_an_unfinished_analysis_is_409(auth_client, media):
 
 
 @pytest.mark.django_db
-def test_report_delegates_to_the_reports_service(auth_client, media,
-                                                 monkeypatch):
-    """The 201 body is the frozen ReportObj, built from the returned row."""
+def test_report_endpoint_really_regenerates(auth_client, media):
+    """
+    ``POST /api/analysis/{id}/report`` re-renders; it does not hand back the
+    row it found.
+
+    This deliberately uses the *real* reports service rather than a stub.
+    The version of this test it replaces monkeypatched
+    ``services.generate_report`` with a one-argument lambda and then asserted
+    on the response *shape*, which is exactly the shape a stale row produces
+    too — so it passed while the endpoint was returning the original
+    ``generated_at`` and the original bytes under a ``201 Created`` (review
+    finding F3). Stubbing the collaborator cannot tell the two apart; only
+    looking at the row and the file can.
+    """
+    from django.utils.dateparse import parse_datetime
+
+    from common.storage import from_media_relative
+    from reports.models import GeneratedReport
+    from reports.services import generate_report_for_analysis
+
     analysis = make_analysis(auth_client.user, media, status=STATUS_DONE)
 
-    class StubReport:
-        report_id = uuid.uuid4()
-        analysis_id = analysis.analysis_id
-        generated_at = timezone.now()
-        page_count = 4
-        file_size_bytes = 284113
+    first = generate_report_for_analysis(analysis)
+    path = from_media_relative(first.report_path)
+    first_generated_at = first.generated_at
+    first_bytes = path.read_bytes()
 
-    monkeypatch.setattr(services, 'generate_report',
-                        lambda _analysis: StubReport())
+    # Change what the PDF should say, so "re-rendered" is observable in the
+    # bytes rather than only in a timestamp.
+    DetectedVehicle.objects.create(
+        analysis=analysis, vehicle_type='truck',
+        bounding_box={'x': 1, 'y': 2, 'w': 3, 'h': 4}, confidence=0.9,
+        frame_number=7, timestamp_seconds=0.35,
+    )
+    analysis.total_vehicles = 1
+    analysis.save(update_fields=['total_vehicles'])
 
     response = auth_client.post(
         reverse('analysis-report', args=[analysis.analysis_id]))
 
     assert response.status_code == 201
     body = response.json()
-    assert body['report_id'] == str(StubReport.report_id)
+
+    # Same row (a shared download link must keep working) ...
+    assert body['report_id'] == str(first.report_id)
     assert body['analysis_id'] == str(analysis.analysis_id)
-    assert body['page_count'] == 4
-    assert body['download_url'] == (
-        f'/api/download-report/{StubReport.report_id}')
+    assert body['download_url'] == f'/api/download-report/{first.report_id}'
+    assert GeneratedReport.objects.filter(analysis=analysis).count() == 1
+
+    # ... but genuinely re-rendered: newer timestamp, new bytes on disk.
+    reloaded = GeneratedReport.objects.get(pk=first.report_id)
+    assert reloaded.generated_at > first_generated_at
+    assert parse_datetime(body['generated_at']) > first_generated_at
+    assert path.read_bytes() != first_bytes
+    assert reloaded.file_size_bytes == path.stat().st_size
 
 
 @pytest.mark.django_db

@@ -79,6 +79,16 @@ SENSITIVITY_MAX = 100
 MASK_THRESHOLD_MIN = 0.05
 MASK_THRESHOLD_MAX = 0.95
 
+#: How the 0-100 "Smoke sensitivity" slider maps onto the segmenter's mask
+#: threshold: ``0.25`` at sensitivity 0 ("Low"), rising to ``0.75`` at 100
+#: ("Strict").  Ascending, because a higher threshold keeps only the pixels
+#: the model is most confident about and is therefore the *stricter* run —
+#: see :func:`build_settings_snapshot` and review finding F21.  The whole
+#: range sits inside ``[MASK_THRESHOLD_MIN, MASK_THRESHOLD_MAX]``, so no
+#: valid slider position is ever clamped.
+MASK_THRESHOLD_AT_ZERO_SENSITIVITY = 0.25
+MASK_THRESHOLD_SENSITIVITY_SPAN = 0.50
+
 #: Statuses that mean "this upload is already being worked on".
 ACTIVE_STATUSES = (STATUS_PENDING, STATUS_QUEUED, STATUS_RUNNING)
 
@@ -125,6 +135,25 @@ DB_RETRY_BACKOFF = 0.05
 
 class ReportsUnavailable(RuntimeError):
     """The reports app could not be imported or is not wired up yet."""
+
+
+class AnalysisInFlight(RuntimeError):
+    """
+    Admission refused: this upload already has a non-terminal run.
+
+    Raised from inside :func:`start_analysis`'s transaction, which is the
+    only place the answer can be trusted — the pre-flight
+    :func:`active_analysis_for` the view does is a courtesy, not a guarantee
+    (review finding F20b).  Carries the offending row so the view can put its
+    id in the 409 body without going back to the database.
+    """
+
+    def __init__(self, analysis):
+        self.analysis = analysis
+        super().__init__(
+            f'Media {analysis.media_id} already has analysis '
+            f'{analysis.analysis_id} in flight (status={analysis.status!r}).'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -252,12 +281,39 @@ def build_settings_snapshot(setting=None, overrides=None):
     everything into a range the pipeline can actually survive.
 
     ``sensitivity`` deserves a note.  The API contract exposes a 0-100
-    "sensitivity" slider but no ``smoke_mask_threshold``; internally the
-    pipeline only understands the latter.  They are inverses — a *more*
-    sensitive run must binarise the segmenter output at a *lower* probability
-    — so sensitivity is mapped to ``smoke_mask_threshold = 1 - s/100``,
-    clamped to a usable band.  Both values are recorded so a report can
-    explain either way round.
+    "Smoke sensitivity" slider but no client-settable
+    ``smoke_mask_threshold`` — :class:`AnalysisSettingsSerializer` has no
+    such field and would silently drop one — so the server derives the
+    threshold the pipeline actually understands from the raw slider value.
+    :func:`build_settings_snapshot` is the *only* place that derivation
+    happens; keep it that way, or the two ends of the control can drift
+    apart again.
+
+    The two ascend **together**: a higher ``sensitivity`` means a *stricter*
+    run.  ``smoke_mask_threshold`` binarises the segmenter's probability
+    map, so raising it keeps only the pixels the model is most confident
+    about — the same direction as the ``confidence_threshold`` the client
+    sends alongside it.  The slider's right-hand "Strict" end is therefore
+    the strictest configuration the API allows.
+
+    This was inverted until review finding F21: the mapping was
+    ``smoke_mask_threshold = 1 - s/100`` and this docstring asserted the two
+    values "are inverses", which made the end of the slider *labelled*
+    ``Strict`` the loosest, highest-false-positive setting on offer — on a
+    run whose PDF is explicitly framed as enforcement evidence.  An
+    inspector dragging toward "Strict" was getting the noisiest possible
+    analysis.  The client half (ascending ``confidence_threshold``
+    0.15 -> 0.75, raw un-inverted ``sensitivity``) has already landed; this
+    is the server half.
+
+    The mapping is now ``0.25 + (s/100) * 0.50`` — 0.25 at Low, 0.50 at
+    Balanced, 0.75 at Strict — which sits wholly inside
+    ``[MASK_THRESHOLD_MIN, MASK_THRESHOLD_MAX]``, so a valid slider position
+    is never silently corrected by the clamp.  The clamp stays anyway, for
+    the same reason every other one here does: ``sensitivity`` is untrusted
+    input and the band is the pipeline's survivable range, not a formatting
+    detail.  Both values are recorded in the snapshot so a report can
+    explain the run either way round.
     """
     setting = setting or SystemSetting.get_solo()
     overrides = overrides or {}
@@ -283,8 +339,13 @@ def build_settings_snapshot(setting=None, overrides=None):
                                 SENSITIVITY_MIN, SENSITIVITY_MAX)
         if sensitivity is not None:
             snapshot['sensitivity'] = sensitivity
+            # Ascending with sensitivity: higher slider = stricter run.
+            # See the docstring (review finding F21) before touching the
+            # direction of this line -- it is half of a control whose other
+            # half lives in the front end.
             snapshot['smoke_mask_threshold'] = clamp_float(
-                1.0 - (sensitivity / 100.0),
+                MASK_THRESHOLD_AT_ZERO_SENSITIVITY
+                + (sensitivity / 100.0) * MASK_THRESHOLD_SENSITIVITY_SPAN,
                 MASK_THRESHOLD_MIN, MASK_THRESHOLD_MAX,
                 default=snapshot['smoke_mask_threshold'],
             )
@@ -356,32 +417,94 @@ def active_analysis_for(media):
     )
 
 
+def _serialise_admissions_for(media):
+    """
+    Make "is a run already in flight for this upload?" a question only one
+    caller at a time can be answering (review finding F20b).
+
+    Must be called as the first statement inside the ``atomic()`` block that
+    then does the check and the insert.  What provides the mutual exclusion
+    differs by backend, and both are real database guarantees rather than a
+    narrower check window:
+
+    **PostgreSQL** — ``SELECT ... FOR UPDATE`` on the parent ``UploadedMedia``
+    row.  The second request blocks on the row lock until the first commits.
+    Django runs at the backend default isolation level, ``READ COMMITTED``,
+    under which every statement takes a fresh snapshot; so once the loser is
+    unblocked its *next* statement — the in-flight check below — sees the
+    winner's committed ``AnalysisResult`` and refuses.  (A deployment that
+    forces ``REPEATABLE READ`` would keep the pre-lock snapshot and this
+    would degrade to the original race; nothing here sets that, and the
+    project's ``DATABASES`` config does not expose it.)
+
+    **SQLite** — there is no row locking, and ``select_for_update()`` raises
+    ``NotSupportedError`` rather than silently doing nothing, so it is
+    skipped.  It is also unnecessary: ``config.settings`` pins
+    ``OPTIONS['transaction_mode'] = 'IMMEDIATE'``, so *entering* the
+    enclosing ``atomic()`` issues ``BEGIN IMMEDIATE`` and takes SQLite's
+    database-wide write lock up front.  The second request therefore blocks
+    at ``BEGIN`` (for up to the 20 s ``busy_timeout``, with
+    :func:`retry_on_lock` behind that), and when it finally begins it reads a
+    post-commit snapshot containing the winner's row.
+
+    Neither path depends on a schema change, so this needs no migration and
+    no partial unique index.
+    """
+    from django.db import connection
+
+    if not connection.features.has_select_for_update:
+        return
+
+    from uploads.models import UploadedMedia
+
+    UploadedMedia.objects.select_for_update().filter(pk=media.pk).first()
+
+
 def start_analysis(user, media, overrides=None, setting=None):
     """
-    Create an :class:`AnalysisResult` for ``media`` and hand it to the worker.
+    Admit ``media`` for analysis, create the row, and hand it to the worker.
 
     Returns the row.  Ownership is the caller's problem (the view has already
-    404'd a foreign ``media_id``); so is the 409 for a run already in flight,
-    because the view needs the existing id for its response body.
+    404'd a foreign ``media_id``).  Admission is *not*: the one-in-flight-run
+    rule is enforced here, inside the same transaction as the insert, and a
+    refusal is raised as :class:`AnalysisInFlight` carrying the row that is
+    already going.  A caller that checks :func:`active_analysis_for` first
+    still gets the cheap common-case answer, but two clicks 50 ms apart used
+    to sail past that check and start the same upload twice — two artefact
+    trees, two reports, two history rows, and the promised 409 never fired
+    (review finding F20b).
 
-    The row is created in its own committed statement *before* the job is
-    enqueued: a worker thread has its own database connection and can only see
-    committed data.  For the same reason this must not be called from inside
-    an ``atomic()`` block when the threaded worker is enabled.
+    The row is created and committed *before* the job is enqueued: a worker
+    thread has its own database connection and can only see committed data.
+    For the same reason this must not be called from inside an ``atomic()``
+    block when the threaded worker is enabled — the ``atomic()`` below would
+    then be a savepoint of the caller's transaction and the worker would
+    chase a row that is not visible to it yet.
     """
     from . import worker
 
     snapshot = build_settings_snapshot(setting=setting, overrides=overrides)
-    analysis = retry_on_lock(
-        lambda: AnalysisResult.objects.create(
-            media=media,
-            user=user,
-            status=STATUS_PENDING,
-            stage='waiting for a worker',
-            settings_snapshot=snapshot,
-        ),
-        'creating the analysis row',
-    )
+
+    def admit():
+        with transaction.atomic():
+            _serialise_admissions_for(media)
+            in_flight = (
+                AnalysisResult.objects
+                .filter(media=media, status__in=ACTIVE_STATUSES)
+                .order_by('-created_at')
+                .first()
+            )
+            if in_flight is not None:
+                raise AnalysisInFlight(in_flight)
+            return AnalysisResult.objects.create(
+                media=media,
+                user=user,
+                status=STATUS_PENDING,
+                stage='waiting for a worker',
+                settings_snapshot=snapshot,
+            )
+
+    analysis = retry_on_lock(admit, 'creating the analysis row')
     logger.info('Analysis %s created for media %s by %s',
                 analysis.analysis_id, media.media_id, user.pk)
 
@@ -390,9 +513,69 @@ def start_analysis(user, media, overrides=None, setting=None):
     return analysis
 
 
+def set_report_status(analysis, value):
+    """
+    Record where report generation for ``analysis`` has got to.
+
+    The one writer of ``AnalysisResult.report_status``.  Every caller that
+    starts, finishes or abandons a render goes through here, so the vocabulary
+    is enforced in a single place and the transitions read as a sequence
+    rather than as scattered column assignments.
+
+    A targeted ``UPDATE`` rather than ``analysis.save()``, for the same reason
+    the worker's progress reporter uses one: the caller is usually holding a
+    fully-loaded row it fetched before a render that took seconds, and saving
+    that instance would push its whole stale in-memory copy over whatever the
+    current owner has written since.  ``exclude()`` makes a repeated
+    transition free of writes — the worker and the reports seam both announce
+    ``generating`` for the same render, which is the normal case, not an error.
+
+    **Never raises.**  This is bookkeeping *about* report generation, not the
+    generation itself.  If the write fails, the caller's own outcome — a
+    rendered PDF, or the exception that stopped one — is still the truth that
+    matters, and a client that gets no signal falls back to the wall-clock
+    budget it has always had.  Crucially, a failure here must not replace the
+    exception a failed render is in the middle of raising: that exception is
+    the thing worth knowing.
+
+    Args:
+        analysis: The ``AnalysisResult`` whose report state is being recorded.
+            Its in-memory ``report_status`` is updated to match, so a
+            serializer handed this same instance does not describe a state two
+            transitions old.
+        value: One of ``analysis.models.REPORT_STATUS_CHOICES``.
+
+    Returns:
+        ``True`` when the stored value actually changed.
+    """
+    try:
+        changed = retry_on_lock(
+            lambda: AnalysisResult.objects.filter(pk=analysis.pk)
+            .exclude(report_status=value)
+            .update(report_status=value),
+            f'recording report_status={value!r} for analysis {analysis.pk}',
+        )
+    except Exception:                       # noqa: BLE001 - advisory by design
+        logger.exception('Could not record report_status=%r for analysis %s',
+                         value, analysis.pk)
+        return False
+
+    analysis.report_status = value
+    return bool(changed)
+
+
 def generate_report(analysis):
     """
-    Produce (or regenerate) the PDF for ``analysis`` via the reports app.
+    Re-render the PDF for ``analysis`` via the reports app.
+
+    Always passes ``force=True``.  The only caller is ``POST /api/analysis/
+    {id}/report``, whose contract is "generate / regenerate" and which answers
+    ``201 Created``: without the flag ``generate_report_for_analysis``
+    short-circuits on the existing row and the endpoint hands back the *old*
+    ``generated_at`` and the *old* bytes while claiming to have created
+    something (review finding F3).  A caller that only wants "a report, if one
+    does not exist yet" — the worker's post-run hook — calls
+    ``reports.services.generate_report_for_analysis`` directly.
 
     Imported lazily and by name so this app has no import-time dependency on
     a sibling that may not have landed yet.  Raises :class:`ReportsUnavailable`
@@ -403,7 +586,7 @@ def generate_report(analysis):
         from reports.services import generate_report_for_analysis
     except Exception as exc:                # noqa: BLE001 - ImportError or worse
         raise ReportsUnavailable(str(exc)) from exc
-    return generate_report_for_analysis(analysis)
+    return generate_report_for_analysis(analysis, force=True)
 
 
 # ---------------------------------------------------------------------------
@@ -647,25 +830,105 @@ def _start_of_day(day):
 
 # ---------------------------------------------------------------------------
 # Deletion
+#
+# An analysis owns files in two separate trees:
+#
+#   MEDIA_ROOT/analyses/<analysis_id>/   preview, frames, crops, masks
+#   MEDIA_ROOT/reports/<report_id>.pdf   the generated report
+#
+# and the only pointer to the second one is the ``GeneratedReport`` row that
+# the ``AnalysisResult`` cascade destroys.  Deleting the row first and then
+# calling ``delete_analysis_artifacts`` — which is what this module used to
+# do — therefore reclaimed the first tree and orphaned the PDF forever
+# (review finding F6).  The functions below resolve *everything* an analysis
+# owns while the rows are still there; ``common.storage.delete_paths`` does
+# the reclaiming afterwards.
 # ---------------------------------------------------------------------------
+
+def artifact_paths_for_analyses(analysis_ids):
+    """
+    Every path on disk owned by these analyses.
+
+    One artefact directory per analysis plus one PDF per generated report.
+    Directories and files are returned in a single list on purpose —
+    :func:`common.storage.delete_paths` dispatches per entry, so no caller
+    has to keep them apart.
+
+    The reports app is consulted through a lazy import, matching
+    :func:`generate_report`: a deployment where ``reports`` cannot be
+    imported still deletes its artefact trees, and says so in the log rather
+    than failing the delete.
+    """
+    from common.storage import analysis_artifact_dir
+
+    ids = [analysis_id for analysis_id in (analysis_ids or ()) if analysis_id]
+    if not ids:
+        return []
+
+    paths = [analysis_artifact_dir(analysis_id, create=False)
+             for analysis_id in ids]
+
+    try:
+        from reports.services import report_paths_for_analyses
+    except Exception:                       # noqa: BLE001 - ImportError or worse
+        logger.warning(
+            'reports app unavailable; %d analysis PDF(s) may be left behind '
+            'on disk.', len(ids), exc_info=True,
+        )
+    else:
+        paths.extend(report_paths_for_analyses(ids))
+
+    return paths
+
+
+def artifact_paths_for_analysis(analysis):
+    """Everything one analysis owns on disk. See :func:`artifact_paths_for_analyses`."""
+    return artifact_paths_for_analyses([analysis.analysis_id])
+
+
+def artifact_paths_for_media(media):
+    """
+    Everything ``media``'s analyses own on disk.
+
+    For the ``DELETE /api/media/{id}`` path, whose cascade
+    (``UploadedMedia`` -> ``AnalysisResult`` -> ``GeneratedReport``) wipes
+    out the rows that were the only record of those files.  Usage::
+
+        leftovers = artifact_paths_for_media(media)   # before the delete
+        media.delete()                                # cascade
+        delete_paths(leftovers)                       # after it commits
+
+    Deliberately *excludes* the upload's own file: that one is a Django
+    ``FileField``, and its owner already deletes it through the storage API.
+    """
+    ids = list(
+        AnalysisResult.objects.filter(media=media)
+        .values_list('analysis_id', flat=True)
+    )
+    return artifact_paths_for_analyses(ids)
+
 
 def delete_analysis(analysis):
     """
-    Remove an analysis row and every artefact it wrote to disk.
+    Remove an analysis row and every file it owns — artefacts *and* its PDF.
 
-    The row goes first, inside a transaction: if the ``rmtree`` fails we would
-    rather leak a few megabytes of JPEGs than leave a row pointing at files
-    that are already gone.  ``delete_analysis_artifacts`` is deliberately
-    called *after* the commit so a rollback cannot destroy live data.
+    Order matters twice over.  The paths are resolved first, because the
+    ``GeneratedReport`` row is the only thing that knows where the PDF is.
+    The row goes next, inside a transaction.  The files go last, after the
+    commit: if the reclaim fails we would rather leak a few megabytes than
+    leave a live row pointing at bytes that are already gone, and a rollback
+    must never be able to destroy data that is still referenced.
     """
-    from common.storage import delete_analysis_artifacts
+    from common.storage import delete_paths
 
     analysis_id = analysis.analysis_id
+    leftovers = artifact_paths_for_analysis(analysis)
 
     def drop():
         with transaction.atomic():
             analysis.delete()
 
     retry_on_lock(drop, f'deleting analysis {analysis_id}')
-    delete_analysis_artifacts(analysis_id)
-    logger.info('Analysis %s deleted with its artefacts', analysis_id)
+    reclaimed = delete_paths(leftovers)
+    logger.info('Analysis %s deleted; reclaimed %d of %d path(s) on disk',
+                analysis_id, reclaimed, len(leftovers))

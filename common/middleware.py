@@ -10,7 +10,12 @@ and every renderer).  Output goes to the ``asg.request`` logger, which
 ``MediaGuardMiddleware`` sits in front of the ``/media/`` tree; see its
 docstring for what it does and, just as importantly, what it deliberately does
 not try to do.
+
+``ApiErrorEnvelopeMiddleware`` is the last line of defence for the project's
+one-error-shape promise: it rewrites an HTML 404 under ``/api/`` into the
+standard JSON envelope (robustness finding §B).
 """
+import json
 import logging
 import posixpath
 import time
@@ -190,3 +195,101 @@ class MediaGuardMiddleware:
                 return f'{prefix} is not publicly served'
 
         return None
+
+
+class ApiErrorEnvelopeMiddleware:
+    """
+    Guarantee the JSON envelope for ``/api/`` 404s (finding ASG-R02 / §B).
+
+    The problem
+    -----------
+    Six routes use Django's ``<uuid:...>`` path converter
+    (``/api/status/<job_id>``, ``/api/media/<media_id>``,
+    ``/api/analysis/<analysis_id>``, ``/api/analysis/<analysis_id>/report``,
+    ``/api/report/<report_id>``, ``/api/download-report/<report_id>``).  A
+    malformed id fails at the *URL resolver*, so no DRF view ever runs and
+    ``common.exceptions.api_exception_handler`` — which DRF only calls from
+    inside ``APIView.dispatch`` — never sees it.  The caller gets Django's
+    HTML 404 instead of ``{detail, code, errors}``, breaking the contract
+    every other failure in the project honours.
+
+    Why this is not just ``handler404``
+    -----------------------------------
+    ``config.urls.handler404`` fixes it — but only with ``DEBUG=False``.
+    ``django.core.handlers.exception.response_for_exception`` short-circuits
+    to ``django.views.debug.technical_404_response`` whenever ``DEBUG`` is on,
+    and that page lists *every registered URL pattern in the project* to an
+    unauthenticated caller.  ``DEBUG=True`` is the default for a fresh clone
+    (no ``SECRET_KEY`` set), so leaving it unhandled means the common case
+    both violates the contract and discloses the routing table.  Rewriting
+    the response covers both settings with one mechanism.
+
+    What it deliberately does not touch
+    -----------------------------------
+    * **Anything outside ``/api/``** — ``/admin/``, ``/media/`` and ``/static/``
+      are consumed by a browser, not by the SPA's error renderer, and Django's
+      HTML 404 is the right answer there.
+    * **Responses DRF produced** (identified by ``accepted_renderer``, which
+      DRF sets on every ``Response`` it renders).  A DRF 404 is already the
+      envelope, and converting a ``BrowsableAPIRenderer`` page to JSON would
+      break the browsable API for no gain.
+    * **Anything already JSON**, and anything streaming.
+    * **5xx.**  ``handler500`` owns those.  Rewriting them here would destroy
+      the ``DEBUG=True`` traceback page, which is a debugging tool, not a
+      contract violation — DRF already catches every exception raised inside
+      a view, so a 500 that reaches this middleware is by definition outside
+      the API surface.
+
+    Ordering
+    --------
+    Registered directly after ``MediaGuardMiddleware``, i.e. near the top of
+    ``MIDDLEWARE``, so its response phase runs *last*: ``CommonMiddleware``
+    has already had its chance to turn a 404 into an ``APPEND_SLASH``
+    redirect (``/api/health`` -> ``/api/health/``), and ``CorsMiddleware``
+    has already attached its headers.  The response is mutated in place
+    rather than replaced so none of those headers — nor
+    ``X-Response-Time-ms`` — is lost.
+    """
+
+    #: Only requests under this prefix are subject to the envelope contract.
+    API_PREFIX = '/api/'
+
+    #: The body written in place of the HTML.  Matches what DRF's handler
+    #: emits for a 404 so the front end cannot tell the two apart.
+    NOT_FOUND_BODY = {'detail': 'Not found.', 'code': 'not_found',
+                      'errors': None}
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        if self._needs_envelope(request, response):
+            self._rewrite(response, self.NOT_FOUND_BODY)
+        return response
+
+    def _needs_envelope(self, request, response):
+        """True when ``response`` breaks the envelope contract for ``request``."""
+        if not str(getattr(request, 'path', '')).startswith(self.API_PREFIX):
+            return False
+        if getattr(response, 'status_code', None) != 404:
+            return False
+        if getattr(response, 'streaming', False):
+            return False
+        # DRF rendered it: already the envelope (or the browsable API).
+        if getattr(response, 'accepted_renderer', None) is not None:
+            return False
+        content_type = (response.headers.get('Content-Type') or '').lower()
+        return not content_type.startswith('application/json')
+
+    @staticmethod
+    def _rewrite(response, body):
+        """Replace the payload in place, preserving every existing header."""
+        payload = json.dumps(body).encode('utf-8')
+        try:
+            response.content = payload
+        except Exception:  # pragma: no cover - non-content response class
+            return
+        response.headers['Content-Type'] = 'application/json'
+        if response.has_header('Content-Length'):
+            response.headers['Content-Length'] = str(len(payload))

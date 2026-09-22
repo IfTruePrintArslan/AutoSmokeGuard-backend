@@ -67,6 +67,7 @@ _EMPTY_FEATURES: dict[str, float] = {
     "darkness": 0.0,
     "compactness": 0.0,
     "largest_blob_ratio": 0.0,
+    "largest_blob_pixels": 0.0,
     "mask_pixels": 0.0,
     "roi_pixels": 0.0,
 }
@@ -99,9 +100,10 @@ def extract_features(
 
     Returns:
         ``{'area_ratio', 'mean_opacity', 'edge_density', 'darkness',
-        'compactness', 'largest_blob_ratio', 'mask_pixels', 'roi_pixels'}``.  All values are in
-        ``[0, 1]`` except the two pixel counts.  Returns zeros for empty or
-        mismatched input rather than raising.
+        'compactness', 'largest_blob_ratio', 'largest_blob_pixels',
+        'mask_pixels', 'roi_pixels'}``.  All values are in ``[0, 1]`` except
+        the three pixel counts.  Returns zeros for empty or mismatched input
+        rather than raising.
     """
     if mask is None or roi is None or roi.size == 0:
         return dict(_EMPTY_FEATURES)
@@ -150,6 +152,11 @@ def extract_features(
         # is one coherent mass; segmentation speckle is many tiny ones, and
         # the two are indistinguishable by total area alone.
         "largest_blob_ratio": round(float(np.clip(largest_blob_px / max(roi_pixels, 1.0), 0.0, 1.0)), 6),
+        # Absolute size of that blob.  ``largest_blob_ratio`` is scale-free,
+        # which is exactly its weakness: 15 pixels in a 112-pixel ROI is 13% of
+        # the area and sails through every ratio gate.  The pipeline pairs the
+        # ratio with a floor on this number -- see MIN_SMOKE_BLOB_PIXELS.
+        "largest_blob_pixels": float(largest_blob_px),
         "mask_pixels": mask_pixels,
         "roi_pixels": roi_pixels,
     }

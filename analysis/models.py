@@ -74,6 +74,44 @@ SEVERITY_CHOICES = (
     (SEVERITY_HIGH, 'High'),
 )
 
+# ---------------------------------------------------------------------------
+# Report-generation vocabulary
+#
+# "Is the server still writing my PDF?" was, until this field existed, a
+# question the client answered with a clock: a terminal analysis carrying no
+# ``report`` yet was assumed to be mid-render until the server's own
+# ``reports.services.REPORT_BUDGET_SECONDS`` (30s) had elapsed.  That guess is
+# right in the common case and wrong in the one that matters — a render that
+# dies two seconds in left the user watching a disabled "Preparing report…"
+# for the other twenty-eight, for work that was already dead.  The server
+# knows exactly which it is, so it says so.
+#
+# Same register as ``STATUS_CHOICES`` above: lowercase, one word, closed set.
+# ``pending`` and ``failed`` are deliberately spelled the same as the analysis
+# statuses they parallel; ``generating`` is *not* spelled ``running`` so that
+# a log line or a schema enum can never be read as the pipeline's own state.
+# ---------------------------------------------------------------------------
+
+REPORT_PENDING = 'pending'
+REPORT_GENERATING = 'generating'
+REPORT_READY = 'ready'
+REPORT_FAILED = 'failed'
+REPORT_SKIPPED = 'skipped'
+
+REPORT_STATUS_CHOICES = (
+    (REPORT_PENDING, 'Pending'),
+    (REPORT_GENERATING, 'Generating'),
+    (REPORT_READY, 'Ready'),
+    (REPORT_FAILED, 'Failed'),
+    (REPORT_SKIPPED, 'Skipped'),
+)
+
+#: Report states nothing moves out of on its own.  ``pending`` and
+#: ``generating`` are the only two that still promise a client something.
+TERMINAL_REPORT_STATUSES = frozenset(
+    {REPORT_READY, REPORT_FAILED, REPORT_SKIPPED},
+)
+
 VEHICLE_TYPE_CHOICES = (
     ('car', 'Car'),
     ('truck', 'Truck'),
@@ -142,6 +180,25 @@ class AnalysisResult(models.Model):
     start_time = models.DateTimeField(null=True, blank=True)
     end_time = models.DateTimeField(null=True, blank=True)
     error_message = models.TextField(blank=True)
+
+    # -- report generation --------------------------------------------------
+    #
+    # The sub-job that runs *after* this one: rendering the PDF.  It is a
+    # separate state because it has a separate lifetime — an analysis is
+    # ``done`` for a window during which its report is still being written,
+    # and it can stay ``done`` forever with a report that failed to render.
+    # Both look identical from ``status`` alone, which is precisely why the
+    # client used to have to guess between them with a stopwatch.
+    #
+    # Written only by targeted ``UPDATE`` (``analysis.services.
+    # set_report_status``), never by ``AnalysisResult.save()``: the worker
+    # holds a stale in-memory row while it renders.
+    report_status = models.CharField(
+        max_length=20,
+        choices=REPORT_STATUS_CHOICES,
+        default=REPORT_PENDING,
+        help_text='State of the PDF report for this run.',
+    )
 
     # -- aggregate results --------------------------------------------------
     total_vehicles = models.IntegerField(default=0)

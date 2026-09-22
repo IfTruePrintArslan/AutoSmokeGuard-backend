@@ -14,7 +14,9 @@ so those names are preserved here rather than "corrected".
 **The row shape is the unit of reuse.**  ``AnalysisRowSerializer`` is what
 ``/api/analysis``, ``/api/history`` and the dashboard's ``recent_analyses``
 all emit; ``AnalysisDetailSerializer`` extends it rather than redefining it,
-so the two can never drift.
+so the two can never drift.  ``report_status`` is therefore a *detail* field
+only: it answers "is my PDF still coming?", which is a question asked by the
+one screen watching one analysis, not by a table of a hundred of them.
 
 **Runtime facts hide inside ``settings_snapshot``.**  The frozen schema has no
 column for ``segmenter_mode``, ``device`` or the annotated-frame list, and
@@ -31,6 +33,9 @@ from rest_framework import serializers
 from common.storage import media_url
 
 from .models import (
+    REPORT_PENDING,
+    REPORT_READY,
+    REPORT_STATUS_CHOICES,
     SEVERITY_CHOICES,
     STATUS_CHOICES,
     VEHICLE_TYPE_CHOICES,
@@ -215,11 +220,15 @@ class AnalysisDetailSerializer(AnalysisRowSerializer):
     vehicles = DetectedVehicleSerializer(many=True, read_only=True)
     segmenter_mode = serializers.SerializerMethodField()
     device = serializers.SerializerMethodField()
+    report_status = serializers.SerializerMethodField()
 
     class Meta(AnalysisRowSerializer.Meta):
+        # ``report_status`` is appended, never inserted: the key is additive
+        # and a client that has never heard of it keeps working unchanged.
         fields = AnalysisRowSerializer.Meta.fields + (
             'settings_snapshot', 'frames_processed', 'error_message',
             'annotated_frames', 'vehicles', 'segmenter_mode', 'device',
+            'report_status',
         )
         read_only_fields = fields
 
@@ -250,6 +259,34 @@ class AnalysisDetailSerializer(AnalysisRowSerializer):
     def get_device(self, analysis) -> str:
         """``'mps'``, ``'cuda:0'`` or ``'cpu'`` — where inference ran."""
         return self._runtime(analysis).get('device') or ''
+
+    @extend_schema_field(serializers.ChoiceField(choices=REPORT_STATUS_CHOICES))
+    def get_report_status(self, analysis):
+        """
+        Where the PDF for this run has got to — the server's own answer.
+
+        Exists so a client never has to infer it from a clock.  ``report``
+        being ``null`` on a ``done`` analysis is ambiguous between "the PDF is
+        being written right now" and "rendering it failed two seconds in", and
+        the only way to tell the difference without this field is to wait out
+        the server's entire 30-second budget and see whether one turns up.
+
+        The stored column is reported as-is with one reconciliation: a row
+        still on the ``pending`` default that nevertheless *has* a report
+        predates this field (or was written by a build without it), and a PDF
+        that exists is ``ready`` whatever the column says.  The reconciliation
+        is deliberately confined to ``pending`` — a stored ``failed`` survives
+        a report row left over from an earlier successful render, because the
+        latest attempt really did fail and saying otherwise would re-hide
+        exactly what this field was added to surface.
+
+        No extra query: ``report`` is already select_related by the detail
+        queryset, and ``get_report`` above reads the same cached relation.
+        """
+        stored = analysis.report_status or REPORT_PENDING
+        if stored == REPORT_PENDING and self._report_of(analysis) is not None:
+            return REPORT_READY
+        return stored
 
 
 # ---------------------------------------------------------------------------

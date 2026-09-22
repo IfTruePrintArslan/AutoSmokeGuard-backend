@@ -44,12 +44,17 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 from common.exceptions import error_response
 from common.pagination import StandardPagination
+# The one builder of the contract's ``ReportObj`` (review finding F18). Safe
+# at module scope: reports.serializers imports no PDF machinery, so a
+# deployment without reportlab still loads this URLconf and still degrades
+# through the 503 path in ``AnalysisReportView.post``.
+from reports.serializers import ReportListSerializer
 from system_config.models import SystemSetting
 from uploads.models import UploadedMedia
 
 from . import services
 from .filters import ALLOWED_ORDERING, AnalysisFilterSet
-from .models import STATUS_DONE, AnalysisResult, SmokeRegion
+from .models import STATUS_DONE, STATUS_QUEUED, AnalysisResult, SmokeRegion
 from .serializers import (
     AnalysisConflictSerializer,
     AnalysisDetailSerializer,
@@ -137,23 +142,27 @@ def conflict_response(detail, analysis):
     )
 
 
-def report_payload(report):
+def report_payload(report, request=None):
     """
-    Build the contract's ``ReportObj`` from a ``GeneratedReport``.
+    Serialise a ``GeneratedReport`` into the contract's ``ReportObj``.
 
-    Assembled here rather than imported from ``reports.serializers`` on
-    purpose: this module must keep importing cleanly whether or not the
-    reports app has landed, and the shape is frozen in the API contract
-    anyway.  The download path is likewise the frozen one.
+    Delegates to ``reports.serializers.ReportListSerializer`` — the *same*
+    class ``GET /api/reports`` uses — rather than hand-building the dict.
+    This module used to carry its own six-key copy so it would keep importing
+    whether or not the reports app had landed; it has landed, and the two
+    shapes had already drifted (the copy omitted the nested ``analysis``
+    summary that every other ``ReportObj`` in the API carries — review
+    finding F18).  One builder, one shape.
+
+    The hard import at the top of this module is deliberate and does not
+    resurrect the coupling the copy was avoiding: ``reports.serializers``
+    pulls in nothing heavier than ``rest_framework`` and ``common.storage``
+    (in particular, *not* ``reports.pdf`` and therefore not ``reportlab``),
+    so the "reports cannot render here" degradation path — a lazy import of
+    ``reports.services`` raising :class:`services.ReportsUnavailable`, which
+    this view turns into a 503 — is completely unaffected.
     """
-    return {
-        'report_id': str(report.report_id),
-        'analysis_id': str(report.analysis_id),
-        'generated_at': report.generated_at,
-        'page_count': report.page_count,
-        'file_size_bytes': report.file_size_bytes,
-        'download_url': f'/api/download-report/{report.report_id}',
-    }
+    return ReportListSerializer(report, context={'request': request}).data
 
 
 # ---------------------------------------------------------------------------
@@ -209,26 +218,49 @@ class AnalyzeView(APIView):
             return error_response(MEDIA_NOT_FOUND, 'media_not_found',
                                   http_status.HTTP_404_NOT_FOUND)
 
+        # Cheap pre-flight so the ordinary "already running" case never pays
+        # for a write transaction. It is *not* the guarantee — two clicks
+        # 50 ms apart both pass it. services.start_analysis re-asks the same
+        # question inside the transaction that does the insert and raises
+        # AnalysisInFlight if it lost (review finding F20b).
         in_flight = services.active_analysis_for(media)
         if in_flight is not None:
             return conflict_response(
                 'This file is already being analysed.', in_flight,
             )
 
-        analysis = services.start_analysis(
-            user=request.user,
-            media=media,
-            overrides=data.get('settings') or {},
-            setting=SystemSetting.get_solo(),
-        )
+        try:
+            analysis = services.start_analysis(
+                user=request.user,
+                media=media,
+                overrides=data.get('settings') or {},
+                setting=SystemSetting.get_solo(),
+            )
+        except services.AnalysisInFlight as refused:
+            logger.info(
+                'Concurrent analyze for media %s lost the admission race to '
+                'analysis %s; answering 409.',
+                media.media_id, refused.analysis.analysis_id,
+            )
+            return conflict_response(
+                'This file is already being analysed.', refused.analysis,
+            )
 
         body = {
             'job_id': str(analysis.analysis_id),
             'analysis_id': str(analysis.analysis_id),
-            # The row's *real* state. With the threaded worker this is always
-            # 'queued' or 'running'; only the synchronous test/--check mode
-            # can already be terminal by the time we answer.
-            'status': analysis.status,
+            # The contract freezes this at "queued" and it is honoured: the
+            # row's real status is only reported when it is already terminal,
+            # which the synchronous test/--check mode (ASG['WORKER_ENABLED']
+            # = False) reaches before this line runs. With the threaded
+            # worker the row is non-terminal here — but *which* non-terminal
+            # value it holds is a race against the worker's claim, which
+            # refresh_from_db() would happily report as "running" (review
+            # finding F17). Callers poll GET /api/status/{job_id} for the
+            # live value; this field just says "accepted, not finished".
+            'status': (
+                analysis.status if analysis.is_terminal else STATUS_QUEUED
+            ),
             'message': (
                 'Analysis queued. Poll /api/status/'
                 f'{analysis.analysis_id} for progress.'
@@ -458,11 +490,15 @@ class AnalysisReportView(APIView):
         summary='Generate a report',
         description=(
             'Renders the PDF emission report for a completed analysis, '
-            'replacing any previous one. Delegates to the reports app.'
+            'replacing any previous one: the PDF is always re-rendered and '
+            'the existing row is overwritten in place, so `generated_at` '
+            'moves forward on every call. Delegates to the reports app, and '
+            'answers with the same `ReportObj` shape as `GET /api/reports`.'
         ),
         request=None,
         responses={
-            201: OpenApiResponse(OpenApiTypes.OBJECT, 'The generated report.'),
+            201: OpenApiResponse(ReportListSerializer,
+                                 'The generated report.'),
             404: OpenApiResponse(ErrorEnvelopeSerializer, 'No such analysis.'),
             409: OpenApiResponse(ErrorEnvelopeSerializer,
                                  'The analysis has not finished.'),
@@ -500,7 +536,7 @@ class AnalysisReportView(APIView):
                 'The report could not be generated.', 'report_failed',
                 http_status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-        return Response(report_payload(report),
+        return Response(report_payload(report, request=request),
                         status=http_status.HTTP_201_CREATED)
 
 

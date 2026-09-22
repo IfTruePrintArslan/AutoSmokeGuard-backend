@@ -20,6 +20,10 @@ from django.utils import timezone
 from PIL import Image
 
 from analysis.models import (
+    REPORT_FAILED,
+    REPORT_GENERATING,
+    REPORT_PENDING,
+    REPORT_READY,
     STATUS_DONE,
     STATUS_RUNNING,
     AnalysisResult,
@@ -28,6 +32,7 @@ from analysis.models import (
     default_severity_counts,
 )
 from common.storage import analysis_artifact_dir, from_media_relative
+from reports import services as reports_services
 from reports.models import GeneratedReport
 from reports.services import ReportNotReady, generate_report_for_analysis
 from uploads.models import UploadedMedia
@@ -584,3 +589,184 @@ class TestListEndpoint:
             many_rows_response = auth_client.get(LIST_URL, {'page_size': 50})
         assert many_rows_response.status_code == 200
         assert many_rows_response.data['count'] == 5
+
+
+# ===========================================================================
+# report_status — the server saying outright whether a PDF is still coming
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestReportStatusTransitions:
+    """
+    ``AnalysisResult.report_status`` as written by this seam.
+
+    The field exists because ``report: null`` on a ``done`` analysis is
+    ambiguous: the PDF may be half rendered, or its render may have died in
+    the first two seconds.  A client cannot tell those apart from outside, and
+    the one it used to assume — "still rendering, wait out the 30-second
+    budget" — is wrong in exactly the case that hurts, leaving the user
+    watching a spinner for work that was already over.
+
+    Every assertion below reads the column back **out of the database** rather
+    than off the in-memory instance: it is the stored row a polling client
+    sees, and an instance attribute that agrees with a column that was never
+    written would pass while proving nothing.
+    """
+
+    @staticmethod
+    def _stored(analysis):
+        return AnalysisResult.objects.values_list(
+            'report_status', flat=True).get(pk=analysis.pk)
+
+    @staticmethod
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError('reportlab fell over')
+
+    def test_an_analysis_starts_out_promising_nothing_more_than_pending(
+            self, auth_client):
+        """
+        No-change guard (passes with and without the transitions below).
+
+        Pins the column's starting point, which every transition test is
+        measured against: 'nothing has been attempted yet' must be the
+        default, so an unattempted render can never read as a finished one.
+        """
+        analysis = _make_analysis(auth_client.user)
+
+        assert self._stored(analysis) == REPORT_PENDING
+
+    def test_generating_is_readable_from_another_connection_mid_render(
+            self, auth_client, monkeypatch):
+        """
+        The in-flight state is announced *before* the expensive call, not
+        after it — a client that polls during the render must see
+        ``generating``, which is the only value that positively promises a
+        PDF is on its way.
+        """
+        analysis = _make_analysis(auth_client.user)
+        real_build = reports_services.build_report
+        observed = []
+
+        def spy(analysis_arg, report_id, target):
+            observed.append(self._stored(analysis_arg))
+            return real_build(analysis_arg, report_id, target)
+
+        monkeypatch.setattr(reports_services, 'build_report', spy)
+
+        generate_report_for_analysis(analysis)
+
+        assert observed == [REPORT_GENERATING], (
+            'report_status was not committed as "generating" before the '
+            f'render started; a mid-render poll would have read {observed}'
+        )
+        assert self._stored(analysis) == REPORT_READY
+
+    def test_a_render_that_raises_lands_in_failed_and_is_never_left_generating(
+            self, auth_client, monkeypatch):
+        """
+        The whole reason this field exists.
+
+        A render that dies must say so.  Left on ``generating`` it is
+        indistinguishable from one still in progress, and the client — which
+        cannot see the exception — would keep a disabled "Preparing report…"
+        on screen for the remainder of the server's 30-second budget, for work
+        that ended seconds ago.
+        """
+        analysis = _make_analysis(auth_client.user)
+        monkeypatch.setattr(reports_services, 'build_report', self._explode)
+
+        with pytest.raises(RuntimeError, match='reportlab fell over'):
+            generate_report_for_analysis(analysis)
+
+        stored = self._stored(analysis)
+        assert stored == REPORT_FAILED, (
+            f'a failed render left report_status={stored!r}; the one state it '
+            'must never be abandoned in is "generating"'
+        )
+        assert stored != REPORT_GENERATING
+        assert not GeneratedReport.objects.filter(analysis=analysis).exists()
+
+    def test_the_exception_still_reaches_the_caller_untouched(
+            self, auth_client, monkeypatch):
+        """
+        Recording the failure must not swallow it, nor replace it.
+
+        The worker's hook catches this so a bad PDF cannot fail a good
+        analysis; ``POST /api/analysis/{id}/report`` lets it surface.  Both
+        depend on the original exception arriving intact.
+
+        No-change guard (passes with and without the transitions): it exists
+        because the obvious way to record a failure — a bare ``except`` that
+        does bookkeeping — is one raise away from replacing the exception the
+        caller needed with a database error about the exception.
+        """
+        analysis = _make_analysis(auth_client.user)
+        monkeypatch.setattr(reports_services, 'build_report', self._explode)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            generate_report_for_analysis(analysis, force=True)
+
+        assert str(exc_info.value) == 'reportlab fell over'
+        assert exc_info.value.__class__ is RuntimeError
+
+    def test_a_failed_regeneration_says_failed_beside_a_surviving_report(
+            self, auth_client, monkeypatch):
+        """
+        ``ready`` implies a report exists; the converse does not hold.
+
+        A forced re-render writes to a temporary file and only replaces the
+        live PDF on success, so a failure leaves the previous one downloadable
+        — but it is still a failure, and saying ``ready`` because an *older*
+        PDF happens to be on disk would re-hide precisely what this field was
+        added to surface.
+        """
+        analysis = _make_analysis(auth_client.user)
+        report = generate_report_for_analysis(analysis)
+        assert self._stored(analysis) == REPORT_READY
+        bytes_before = from_media_relative(report.report_path).read_bytes()
+
+        monkeypatch.setattr(reports_services, 'build_report', self._explode)
+        with pytest.raises(RuntimeError):
+            generate_report_for_analysis(analysis, force=True)
+
+        assert self._stored(analysis) == REPORT_FAILED
+        assert from_media_relative(report.report_path).read_bytes() == bytes_before
+
+    def test_an_analysis_that_is_not_done_leaves_the_column_alone(
+            self, auth_client):
+        """
+        ``ReportNotReady`` is a precondition, not a failure.
+
+        Nothing was attempted, so nothing failed: marking this ``failed``
+        would tell a client watching a *running* analysis that its report is
+        never coming, while the run that will produce it is still going.
+
+        No-change guard (passes with and without the transitions): it is the
+        boundary of the new writes, not one of them.
+        """
+        analysis = _make_analysis(auth_client.user, status=STATUS_RUNNING,
+                                  end_time=None)
+
+        with pytest.raises(ReportNotReady):
+            generate_report_for_analysis(analysis)
+
+        assert self._stored(analysis) == REPORT_PENDING
+
+    def test_the_fast_path_heals_a_row_written_before_this_field_existed(
+            self, auth_client):
+        """
+        A PDF that demonstrably exists is ``ready``, whatever the column says.
+
+        Rows created by an earlier build carry the ``pending`` default beside
+        a perfectly good report; the cheap existing-report path corrects them
+        on the way past rather than leaving the API describing a render that
+        finished long ago as one that has not started.
+        """
+        analysis = _make_analysis(auth_client.user)
+        generate_report_for_analysis(analysis)
+        AnalysisResult.objects.filter(pk=analysis.pk).update(
+            report_status=REPORT_PENDING)
+
+        generate_report_for_analysis(analysis)      # force=False: no re-render
+
+        assert self._stored(analysis) == REPORT_READY

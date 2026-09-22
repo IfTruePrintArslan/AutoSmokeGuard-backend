@@ -63,3 +63,11 @@ ml_assets/runs/
 .vscode/
 .idea/
 *.log
+
+# Real-data evaluation artefacts (regenerable; contains third-party imagery
+# of unverified licence — must never be committed).
+ml_assets/eval_real/
+
+# Previous model checkpoint (not lost; recoverable from git history via
+# git show f7ed668:ml_assets/smoke_unet.pt > ml_assets/smoke_unet.prev.pt).
+ml_assets/smoke_unet.*.pt

@@ -21,6 +21,20 @@ request objects and no return value anyone depends on.  Swapping
 ``job_queue.enqueue`` for ``run_analysis.delay`` is a ten-line change if this
 ever needs to scale past one box.
 
+More than one serving process
+-----------------------------
+The queue is per *process*, but the deployment is not: ``docker/entrypoint.sh``
+ships ``gunicorn --workers 2``, so two independent Python processes each run
+their own pool, their own ``AppConfig.ready()`` and their own boot-time
+recovery sweep against one shared database.  Everything in this module that
+touches a row another process might own is therefore scoped by an ownership
+stamp — ``(host, pid, boot)`` written into
+``settings_snapshot['_runtime']['owner']`` atomically with the status
+transition that creates the obligation.  See the "Job ownership" block below;
+it is what stops one worker's restart from failing another worker's live
+analysis, and what stops that analysis from later resurrecting the row it was
+told it had lost.
+
 Four things this module is careful about
 ----------------------------------------
 **Database connections.**  Every thread Django touches gets its own
@@ -50,11 +64,14 @@ the forward pass; see the long comment on it for the full reasoning.
 import atexit
 import logging
 import os
+import socket
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait as wait_for_futures
+from datetime import timedelta
 from pathlib import Path
 
 from django.conf import settings
@@ -65,6 +82,10 @@ from common.storage import analysis_artifact_dir, to_media_relative
 from system_config.models import SystemSetting
 
 from .models import (
+    REPORT_FAILED,
+    REPORT_GENERATING,
+    REPORT_READY,
+    REPORT_SKIPPED,
     SEVERITY_HIGH,
     SEVERITY_LOW,
     SEVERITY_MODERATE,
@@ -83,6 +104,7 @@ from .services import (
     build_ml_config,
     is_lock_error,
     retry_on_lock,
+    set_report_status,
     worst_severity,
 )
 
@@ -146,6 +168,24 @@ NON_SERVING_COMMANDS = frozenset({
     'startproject', 'test', 'testserver',
 })
 
+#: ``argv[0]`` basenames that mean "this process was launched as a Django
+#: management command".  Anything else — gunicorn, uwsgi, daphne, uvicorn,
+#: mod_wsgi's embedded interpreter — is a real server and always bootstraps.
+MANAGEMENT_ENTRYPOINTS = frozenset({
+    'manage.py', 'django-admin', 'django-admin.py',
+})
+
+#: Key inside ``settings_snapshot[RUNTIME_KEY]`` recording which process is
+#: responsible for a non-terminal row.  See :func:`process_owner`.
+OWNER_KEY = 'owner'
+
+#: Default age, in seconds, past which a non-terminal job owned by a process
+#: this host cannot ask about (i.e. one on a *different* host) is presumed
+#: dead.  Deliberately generous — the only cost of waiting is a progress bar
+#: that keeps spinning, while the cost of being wrong is killing a live
+#: analysis.  Override with ``ASG['STALE_JOB_SECONDS']``.
+DEFAULT_STALE_JOB_SECONDS = 6 * 60 * 60
+
 
 # ---------------------------------------------------------------------------
 # User-facing failure messages
@@ -197,6 +237,170 @@ def user_safe_error(exc):
     return DEFAULT_ERROR_MESSAGE
 
 
+# ---------------------------------------------------------------------------
+# Job ownership
+#
+# Why a row has to know who is running it (review finding ASG-R06)
+# ----------------------------------------------------------------
+# The recovery sweep used to be a single unscoped statement::
+#
+#     AnalysisResult.objects.filter(status__in=('running', 'queued')) \
+#                           .update(status='failed', ...)
+#
+# which is correct for exactly one deployment shape: a single serving
+# process.  The shipped production default is not that shape —
+# ``docker/entrypoint.sh`` runs ``gunicorn --workers 2``, so there are two
+# independent Python processes, each with its own ``AppConfig.ready()``, its
+# own bootstrap thread and its own thread pool.  If gunicorn's arbiter
+# replaces one worker (``--timeout 300`` expiry, ``SIGHUP`` reload, OOM
+# kill), the replacement booted and blanket-failed *the other worker's live
+# analysis*: the user's page flipped to "Analysis failed" while the run was
+# still going, and minutes later the run finished and wrote ``done`` back
+# over the top, resurrecting a row the user had already been told was dead.
+#
+# The fix is ownership.  A row is stamped with the process that is
+# responsible for it, atomically, in the same statement that moves it into
+# ``queued`` or ``running``, so there is no window in which a live row has no
+# owner.  The sweep then only resolves rows whose owner is demonstrably gone,
+# and ``_persist`` refuses to write a result for a row it no longer owns.
+#
+# The stamp lives in ``settings_snapshot[RUNTIME_KEY]['owner']``.  That JSON
+# column is already the documented home for per-run runtime data that the
+# frozen schema has no column for (``analysis.services.RUNTIME_KEY``), and
+# the detail serializer already strips underscore-prefixed keys back out — so
+# this needs no migration and changes no API response.
+#
+# Identity is ``(host, pid, boot)``:
+#
+# * **host** — ``socket.gethostname()``.  A pid is only meaningful on the
+#   machine that issued it, and this project supports PostgreSQL, so two
+#   containers can legitimately share one database.
+# * **pid** — what makes the liveness probe possible.
+# * **boot** — a UUID minted per *process*, not per import.  Pids are reused:
+#   after a crash a new process can be handed the dead one's pid, and without
+#   ``boot`` it could not tell "my own row" from "the row of the process I
+#   replaced".  It is cached against ``os.getpid()`` so a ``fork`` (gunicorn
+#   ``--preload``, which this project does not use today but might) gives the
+#   child a fresh identity instead of silently inheriting its parent's.
+# ---------------------------------------------------------------------------
+
+#: ``{pid: boot uuid}`` — one entry, replaced whenever the pid changes.
+_boot_ids = {}
+_boot_id_lock = threading.Lock()
+
+
+def _boot_id():
+    """A UUID identifying this OS process, stable for its whole lifetime."""
+    pid = os.getpid()
+    with _boot_id_lock:
+        cached = _boot_ids.get(pid)
+        if cached is None:
+            cached = uuid.uuid4().hex
+            # A fork makes the parent's entry meaningless in the child.
+            _boot_ids.clear()
+            _boot_ids[pid] = cached
+        return cached
+
+
+def process_owner():
+    """This process's ownership stamp, as a JSON-serialisable dict."""
+    return {
+        'host': socket.gethostname(),
+        'pid': os.getpid(),
+        'boot': _boot_id(),
+        'at': timezone.now().isoformat(),
+    }
+
+
+def owner_of(snapshot):
+    """The owner dict recorded in ``snapshot``, or ``None``."""
+    runtime = (snapshot or {}).get(RUNTIME_KEY)
+    if not isinstance(runtime, dict):
+        return None
+    owner = runtime.get(OWNER_KEY)
+    return owner if isinstance(owner, dict) else None
+
+
+def snapshot_with_owner(snapshot):
+    """
+    Return a copy of ``snapshot`` carrying this process's ownership stamp.
+
+    Copies rather than mutates: the caller's dict is usually the one attached
+    to a live model instance, and a JSONField that is mutated in place does
+    not reliably round-trip through ``update_fields``.
+    """
+    merged = dict(snapshot or {})
+    runtime = dict(merged.get(RUNTIME_KEY) or {})
+    runtime[OWNER_KEY] = process_owner()
+    merged[RUNTIME_KEY] = runtime
+    return merged
+
+
+def snapshot_without_owner(snapshot):
+    """Return a copy of ``snapshot`` with the ownership stamp removed."""
+    merged = dict(snapshot or {})
+    runtime = merged.get(RUNTIME_KEY)
+    if isinstance(runtime, dict) and OWNER_KEY in runtime:
+        runtime = dict(runtime)
+        runtime.pop(OWNER_KEY, None)
+        merged[RUNTIME_KEY] = runtime
+    return merged
+
+
+def is_owned_by_this_process(snapshot):
+    """True when ``snapshot``'s owner stamp is this exact process."""
+    owner = owner_of(snapshot)
+    return bool(owner) and owner.get('boot') == _boot_id()
+
+
+def process_is_alive(pid):
+    """
+    ``True`` / ``False`` / ``None`` (unknowable) for "is ``pid`` running?".
+
+    POSIX uses ``os.kill(pid, 0)``, the standard side-effect-free liveness
+    probe: it performs the permission checks and then does nothing.
+
+    **Never on Windows.**  CPython's ``os.kill`` on Windows maps every signal
+    other than ``CTRL_C_EVENT``/``CTRL_BREAK_EVENT`` onto
+    ``TerminateProcess(handle, sig)`` — so ``os.kill(pid, 0)`` there does not
+    ask whether the process is alive, it *kills* it.  Using the POSIX idiom
+    unguarded would turn this recovery sweep into a tool that murders the
+    sibling worker it was trying to protect.  There is no dependency-free
+    Windows equivalent, so this returns ``None`` and
+    :func:`_recovery_verdict` decides what to do with "unknown".
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    if pid == os.getpid():
+        return True
+    if os.name != 'posix':
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # It exists; it just belongs to another user.
+        return True
+    except OSError:                                   # pragma: no cover
+        return None
+    return True
+
+
+def stale_job_seconds():
+    """How long a job owned by an unreachable host may sit before it is failed."""
+    configured = getattr(settings, 'ASG', {}).get(
+        'STALE_JOB_SECONDS', DEFAULT_STALE_JOB_SECONDS,
+    )
+    try:
+        configured = int(configured)
+    except (TypeError, ValueError):
+        configured = DEFAULT_STALE_JOB_SECONDS
+    return max(60, configured)
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +472,15 @@ def run_analysis(analysis_id):
         return None
 
     try:
-        _execute(analysis)
+        persisted = _execute(analysis)
     except Exception as exc:                          # noqa: BLE001 - by design
         _mark_failed(analysis_id, exc)
+        return None
+
+    if not persisted:
+        # The row belongs to somebody else now (see _persist's ownership
+        # gate). Generating a PDF from a result we were not allowed to store
+        # would attach a report to a row whose contents say something else.
         return None
 
     _maybe_generate_report(analysis)
@@ -284,7 +494,25 @@ def _claim(analysis_id):
     The conditional ``UPDATE`` is the whole concurrency story: whichever
     thread's statement matches the ``status='queued'`` predicate wins, and
     every other caller sees ``0`` rows affected.
+
+    The ownership stamp goes into that *same* statement (review finding
+    ASG-R06).  Writing it afterwards would leave a window — however short —
+    in which a genuinely running row looks unowned, and an unowned
+    non-terminal row is exactly what :func:`recover_interrupted_jobs` treats
+    as an orphan.  Reading the snapshot first costs one extra ``SELECT`` per
+    job, which is nothing next to the run it precedes.
     """
+    row = retry_on_lock(
+        lambda: AnalysisResult.objects.filter(pk=analysis_id)
+        .values('settings_snapshot').first(),
+        f'reading the snapshot of analysis {analysis_id}',
+    )
+    if row is None:
+        logger.warning('Analysis %s does not exist; nothing to claim.',
+                       analysis_id)
+        return None
+    owned_snapshot = snapshot_with_owner(row['settings_snapshot'])
+
     claimed = retry_on_lock(
         lambda: AnalysisResult.objects.filter(
             pk=analysis_id, status=STATUS_QUEUED,
@@ -295,6 +523,7 @@ def _claim(analysis_id):
             error_message='',
             start_time=timezone.now(),
             end_time=None,
+            settings_snapshot=owned_snapshot,
         ),
         f'claiming analysis {analysis_id}',
     )
@@ -316,7 +545,13 @@ def _claim(analysis_id):
 
 
 def _execute(analysis):
-    """Run the pipeline and persist everything it produced."""
+    """
+    Run the pipeline and persist everything it produced.
+
+    Returns ``True`` when the result was written, ``False`` when
+    :func:`_persist` declined it because the row is no longer this process's
+    to write (review finding ASG-R06).
+    """
     from mlcore import analyze_media
 
     snapshot = analysis.settings_snapshot or {}
@@ -344,10 +579,23 @@ def _execute(analysis):
         )
     elapsed = time.monotonic() - started
 
-    _persist(analysis, result or {}, output_dir)
+    if not _persist(analysis, result or {}, output_dir):
+        # _persist already logged, at ERROR, exactly why it declined.  Return
+        # instead of raising: raising would route into _mark_failed, which
+        # would stamp this row a second time — and the whole point of
+        # declining was that this process no longer has any business writing
+        # to it.
+        logger.warning(
+            'Analysis %s ran to completion in %.2fs but its result was '
+            'discarded; the row is no longer owned by this worker.',
+            analysis.analysis_id, elapsed,
+        )
+        return False
+
     logger.info('Analysis %s finished in %.2fs (%s vehicles, %s smoke)',
                 analysis.analysis_id, elapsed, analysis.total_vehicles,
                 analysis.total_smoke)
+    return True
 
 
 def _persist(analysis, result, output_dir):
@@ -440,6 +688,11 @@ def _persist(analysis, result, output_dir):
         reported_confidence = sum(confidences) / len(confidences)
 
     snapshot = dict(analysis.settings_snapshot or {})
+    # Replacing _runtime wholesale intentionally drops the ownership stamp
+    # (review finding ASG-R06): the row is about to become terminal, and a
+    # terminal row has no owner — nothing is running it, and leaving a stale
+    # (host, pid) behind would only invite a future sweep to reason about a
+    # process that has nothing to do with it.
     snapshot[RUNTIME_KEY] = runtime
 
     analysis.total_vehicles = len(vehicles)
@@ -480,6 +733,57 @@ def _persist(analysis, result, output_dir):
     def write():
         """The whole result, atomically. Retried as a unit if it is locked."""
         with transaction.atomic():
+            # -- Ownership gate (review finding ASG-R06) -------------------
+            #
+            # Between the claim and here, minutes of inference have gone by.
+            # Another process's boot sweep may have decided this row was
+            # abandoned and failed it; an administrator may have deleted it.
+            # Writing ``done`` unconditionally at that point *resurrects* a
+            # row the user has already been told is dead — the second half of
+            # the gunicorn multi-worker bug, and the half that makes it
+            # silent rather than merely wrong.
+            #
+            # Who wins: the worker that did the work, but only while it still
+            # owns the row.  Ownership is the tie-breaker rather than "last
+            # writer wins" because ownership is the thing that was true when
+            # the work started and the thing whose loss means somebody else
+            # has already acted on this row.  Losing it is not recoverable
+            # from here, so the result is discarded and the loss is logged at
+            # ERROR — the artefacts stay on disk for forensics rather than
+            # being silently reconciled one way or the other.
+            current = (
+                AnalysisResult.objects
+                .filter(pk=analysis.analysis_id)
+                .values('status', 'settings_snapshot')
+                .first()
+            )
+            if current is None:
+                logger.error(
+                    'Analysis %s no longer exists; discarding the result of '
+                    'a run that had already completed.',
+                    analysis.analysis_id,
+                )
+                return False
+            if current['status'] != STATUS_RUNNING:
+                logger.error(
+                    'Refusing to save the result of analysis %s: the row is '
+                    'now status=%r, not %r. Another process resolved it '
+                    'while this run was in flight; the result is being '
+                    'discarded rather than resurrecting the row.',
+                    analysis.analysis_id, current['status'], STATUS_RUNNING,
+                )
+                return False
+            if not is_owned_by_this_process(current['settings_snapshot']):
+                logger.error(
+                    'Refusing to save the result of analysis %s: it is now '
+                    'owned by %r, not by this process (pid %s). The result '
+                    'is being discarded rather than overwriting whatever the '
+                    'current owner is doing.',
+                    analysis.analysis_id,
+                    owner_of(current['settings_snapshot']), os.getpid(),
+                )
+                return False
+
             # Re-running an analysis in place must not duplicate its children.
             # SmokeRegion rows cascade off the vehicles.
             analysis.vehicles.all().delete()
@@ -493,8 +797,9 @@ def _persist(analysis, result, output_dir):
                 'preview_path', 'settings_snapshot', 'status', 'progress',
                 'stage', 'error_message', 'end_time',
             ])
+            return True
 
-    retry_on_lock(write, f'saving analysis {analysis.analysis_id}')
+    return bool(retry_on_lock(write, f'saving analysis {analysis.analysis_id}'))
 
 
 def _maybe_generate_report(analysis):
@@ -506,27 +811,66 @@ def _maybe_generate_report(analysis):
     that is missing, broken or mid-rewrite must never turn a successful
     analysis into a failed one, so every exception is swallowed after being
     logged in full.
+
+    Swallowed, but no longer *silent*.  Each branch stamps
+    ``AnalysisResult.report_status`` on the way through — ``skipped`` when the
+    frozen configuration never asked for a PDF, ``generating`` while one is
+    being made, then ``ready`` or ``failed``.  Without that, "the report is
+    still being written" and "the report died four seconds ago" are the same
+    observation from outside (a ``done`` analysis with no ``report``), and the
+    UI could only tell them apart by waiting out the server's whole 30-second
+    budget on the off-chance.
+
+    The ``failed`` stamp is deliberately written here as well as inside
+    ``reports.services.generate_report_for_analysis``.  The seam cannot record
+    what it never reached: the import above is itself inside the ``try``, and
+    an unimportable (or stubbed, or half-rewritten) reports app is exactly the
+    kind of breakage this hook was built to absorb.  One state this row must
+    never be abandoned in is ``generating``.
     """
     if not (analysis.settings_snapshot or {}).get('auto_generate_pdf'):
+        set_report_status(analysis, REPORT_SKIPPED)
         return
+
+    set_report_status(analysis, REPORT_GENERATING)
     try:
         from reports.services import generate_report_for_analysis
         generate_report_for_analysis(analysis)
     except Exception:                                 # noqa: BLE001 - by design
         logger.exception('report generation failed; analysis %s still succeeds',
                          analysis.analysis_id)
+        set_report_status(analysis, REPORT_FAILED)
+    else:
+        set_report_status(analysis, REPORT_READY)
 
 
 def _mark_failed(analysis_id, exc):
-    """Record a failure: full detail to the log, one safe sentence to the row."""
+    """
+    Record a failure: full detail to the log, one safe sentence to the row.
+
+    Scoped to ``status='running'`` (review finding ASG-R06).  A row that
+    another process has already resolved must not have its ``error_message``
+    rewritten by a worker that has lost it — the caller sees whatever the
+    current owner decided, and the real cause is in the log either way.
+
+    ``report_status`` is resolved in the same statement.  A run that failed
+    never reaches :func:`_maybe_generate_report`, so the column would
+    otherwise be abandoned at its ``pending`` default — a row promising a PDF
+    that nothing will ever render, and which the report endpoint would refuse
+    to make on request (it requires ``status='done'``).  ``skipped`` is the
+    honest reading: no report applies to this run.
+    """
     logger.exception('Analysis %s failed', analysis_id)
     try:
         retry_on_lock(
-            lambda: AnalysisResult.objects.filter(pk=analysis_id).update(
+            lambda: AnalysisResult.objects.filter(
+                pk=analysis_id, status=STATUS_RUNNING,
+            ).update(
                 status=STATUS_FAILED,
                 stage='failed',
                 error_message=user_safe_error(exc),
                 end_time=timezone.now(),
+                report_status=REPORT_SKIPPED,
             ),
             f'failing analysis {analysis_id}',
         )
@@ -614,13 +958,31 @@ class JobQueue:
         thread*, before returning.  That is what makes the test suite
         deterministic and what lets a ``--check`` boot prove the pipeline
         end to end without a second thread.
+
+        The row is stamped with this process's ownership in the same
+        statement that queues it (review finding ASG-R06).  A ``queued`` row
+        lives in *this* process's ``ThreadPoolExecutor`` and nowhere else, so
+        a sibling gunicorn worker rebooting must be able to see that the job
+        belongs to someone else and leave it alone — and must equally be able
+        to see, when this process dies, that nothing is left to run it.
         """
         analysis_id = str(analysis_id)
+        row = retry_on_lock(
+            lambda: AnalysisResult.objects.filter(pk=analysis_id)
+            .values('settings_snapshot').first(),
+            f'reading the snapshot of analysis {analysis_id}',
+        )
+        if row is None:
+            logger.info('Analysis %s does not exist; not enqueued.',
+                        analysis_id)
+            return False
+        owned_snapshot = snapshot_with_owner(row['settings_snapshot'])
+
         accepted = retry_on_lock(
             lambda: AnalysisResult.objects.filter(
                 pk=analysis_id, status__in=(STATUS_PENDING, STATUS_QUEUED),
             ).update(status=STATUS_QUEUED, progress=0, stage='queued',
-                     error_message=''),
+                     error_message='', settings_snapshot=owned_snapshot),
             f'queueing analysis {analysis_id}',
         )
         if not accepted:
@@ -731,14 +1093,76 @@ atexit.register(graceful_shutdown)
 # Startup
 # ---------------------------------------------------------------------------
 
+def is_serving_context(argv=None, environ=None):
+    """
+    Whether ``argv``/``environ`` describe a process that will serve traffic.
+
+    Pure and injectable so every deployment shape this project supports can be
+    asserted in a unit test rather than discovered in production — which is
+    exactly how the bug below escaped.
+
+    Why not ``RUN_MAIN`` alone (robustness finding §D)
+    --------------------------------------------------
+    The previous rule was ``command == 'runserver' and RUN_MAIN != 'true' ->
+    don't bootstrap``.  ``RUN_MAIN`` is set by Django's autoreloader when it
+    re-execs itself, so under plain ``runserver`` it correctly picks the child
+    out of the parent/child pair.  But ``runserver --noreload`` never starts
+    an autoreloader at all, so ``RUN_MAIN`` is *never set* — and the rule then
+    returned ``False`` unconditionally, for the entire life of the process.
+    Both the crash-recovery sweep and the ML warm-up were silently skipped, so
+    a job killed mid-flight stayed ``running`` forever and the UI spun with
+    no process behind it.
+
+    The reloader is therefore detected from ``argv`` (where the decision
+    actually lives) and ``RUN_MAIN`` is consulted only when there really is a
+    parent/child pair to choose between:
+
+    ==========================================  ==========================
+    Invocation                                  Result
+    ==========================================  ==========================
+    ``manage.py runserver`` (parent)            ``False`` — child does it
+    ``manage.py runserver`` (child, RUN_MAIN)   ``True``
+    ``manage.py runserver --noreload``          ``True``  <- was ``False``
+    ``gunicorn config.wsgi:application``        ``True``
+    ``uwsgi --module config.wsgi``              ``True``
+    ``manage.py migrate`` / ``test`` / ...      ``False``
+    ==========================================  ==========================
+    """
+    argv = list(sys.argv if argv is None else argv)
+    environ = os.environ if environ is None else environ
+
+    entrypoint = os.path.basename(argv[0]) if argv and argv[0] else ''
+    args = argv[1:]
+    command = args[0] if args else ''
+
+    if entrypoint not in MANAGEMENT_ENTRYPOINTS:
+        # gunicorn, uWSGI, daphne, uvicorn, mod_wsgi, or any other WSGI/ASGI
+        # server importing config.wsgi directly.  One process per worker, no
+        # autoreloader, nothing to de-duplicate against: always bootstrap.
+        return True
+
+    if command in NON_SERVING_COMMANDS:
+        return False
+
+    if command == 'runserver':
+        if '--noreload' in args:
+            # Single process, no re-exec, no RUN_MAIN — this *is* the server.
+            return True
+        return environ.get('RUN_MAIN') == 'true'
+
+    # Some other management command.  Historically these bootstrapped (the
+    # project ships custom serving-adjacent commands), so the permissive
+    # default is kept rather than changed as a side effect of this fix.
+    return True
+
+
 def should_bootstrap():
     """
     Whether this process should warm the models and sweep stale jobs.
 
-    Skipped for management commands that are not serving traffic, under
-    pytest, when the worker is disabled, and in the ``runserver``
-    autoreloader's *parent* process (which forks and would otherwise load
-    torch twice).  ``ASG_WORKER_BOOTSTRAP=False`` forces it off entirely.
+    Skipped when the worker is disabled, under pytest, and for anything
+    :func:`is_serving_context` does not recognise as a serving process.
+    ``ASG_WORKER_BOOTSTRAP=False`` forces it off entirely.
     """
     if os.environ.get('ASG_WORKER_BOOTSTRAP', '') == 'False':
         return False
@@ -746,43 +1170,138 @@ def should_bootstrap():
         return False
     if 'pytest' in sys.modules or 'PYTEST_CURRENT_TEST' in os.environ:
         return False
+    return is_serving_context()
 
-    argv = sys.argv[1:]
-    command = argv[0] if argv else ''
-    if command in NON_SERVING_COMMANDS:
-        return False
-    if command == 'runserver' and os.environ.get('RUN_MAIN') != 'true':
-        # The reloader's supervising process; the child does the real work.
-        return False
-    return True
+
+def _recovery_verdict(row, stale_cutoff):
+    """
+    Decide whether the boot sweep may fail ``row``.  ``(bool, reason)``.
+
+    The default is **no**: a live analysis that is wrongly failed is a
+    user-visible data-integrity bug, while a dead one that survives a sweep
+    is only a progress bar that keeps spinning until the next restart.  Every
+    "yes" below therefore needs positive evidence that nothing is behind the
+    row.
+    """
+    owner = owner_of(row['settings_snapshot'])
+
+    if not owner:
+        # No process ever took responsibility for it.  Both transitions into
+        # a non-terminal status (``enqueue`` -> queued, ``_claim`` ->
+        # running) write the stamp in the *same* statement as the status, so
+        # there is no window where a live row looks like this: an unowned
+        # row is a row from before this fix shipped, or one a fixture or an
+        # administrator created by hand.  Either way nothing is running it.
+        return True, 'no process ever claimed it'
+
+    host = owner.get('host')
+    pid = owner.get('pid')
+
+    if owner.get('boot') == _boot_id():
+        # This very process owns it.  Cannot happen during the boot sweep
+        # (we have not claimed anything yet); if it ever does, the job is
+        # live and ours.
+        return False, 'this process owns it'
+
+    if host != socket.gethostname():
+        # Another machine's pid means nothing here, and it may well be
+        # running the job right now (PostgreSQL deployments share one
+        # database across containers).  Only age can settle it.
+        started = row.get('start_time') or row.get('created_at')
+        if started is not None and started < stale_cutoff:
+            return True, f'owned by host {host!r} and untouched since {started}'
+        return False, f'owned by another host ({host!r})'
+
+    alive = process_is_alive(pid)
+    if alive is True:
+        return False, f'its owner (pid {pid}) is still running on this host'
+    if alive is False:
+        return True, f'its owning process (pid {pid}) is gone'
+
+    # Liveness is unknowable: a non-POSIX host (see process_is_alive — we
+    # must not use os.kill on Windows).  Windows has no multi-process
+    # serving story for this project (gunicorn is POSIX-only; the supported
+    # shape there is a single `manage.py runserver`), so a *different* pid on
+    # this host is necessarily a process that has already exited.  Revisit
+    # this line if a multi-process Windows server is ever supported.
+    return True, (f'pid {pid} is not this process and liveness cannot be '
+                  f'probed on {os.name!r}')
 
 
 def recover_interrupted_jobs():
     """
-    Resolve jobs that were in flight when the process last died.
+    Resolve jobs that were in flight when *their own* process died.
 
-    An in-process queue cannot survive a restart: anything left ``running``
-    has no thread behind it, and anything left ``queued`` has no submission
-    behind it.  Both are dead ends, so both are failed with an honest message
-    instead of spinning a progress bar forever.
+    An in-process queue does not survive a restart: a row left ``running``
+    has no thread behind it and a row left ``queued`` has no submission
+    behind it, so both would otherwise spin a progress bar forever.  They are
+    failed with an honest message instead.
 
-    This assumes a single serving process, which is the deployment this worker
-    is designed for.  Behind a multi-process server the sweep would have to be
-    scoped by a process/heartbeat column — the point at which the Celery seam
-    is the right answer instead.
+    Scoped by ownership, not blanket (review finding ASG-R06)
+    ---------------------------------------------------------
+    This used to be one unscoped ``UPDATE`` over every ``running``/``queued``
+    row, on the assumption — stated in this docstring — of a single serving
+    process.  The shipped production default is ``gunicorn --workers 2``
+    (``docker/entrypoint.sh``), which is two processes, so the assumption was
+    false: when the arbiter replaced one worker, the replacement's boot sweep
+    failed the *other* worker's live analysis, and that analysis then wrote
+    ``done`` back over the top when it finished.
+
+    Now every non-terminal row carries the ``(host, pid, boot)`` of the
+    process responsible for it (see :func:`process_owner`), stamped
+    atomically with the status transition, and this sweep only resolves a row
+    when it can show that process is gone.  A row owned by a live sibling is
+    left strictly alone.  :func:`_recovery_verdict` holds the rules and the
+    reasoning for each.
+
+    Returns the number of rows failed.
     """
-    stale = AnalysisResult.objects.filter(
-        status__in=(STATUS_RUNNING, STATUS_QUEUED),
+    now = timezone.now()
+    stale_cutoff = now - timedelta(seconds=stale_job_seconds())
+
+    candidates = list(
+        AnalysisResult.objects
+        .filter(status__in=(STATUS_RUNNING, STATUS_QUEUED))
+        .values('analysis_id', 'status', 'settings_snapshot', 'start_time',
+                'created_at')
     )
-    count = stale.update(
-        status=STATUS_FAILED,
-        stage='failed',
-        error_message=INTERRUPTED_MESSAGE,
-        end_time=timezone.now(),
-    )
-    if count:
-        logger.warning('Marked %d interrupted analysis job(s) as failed', count)
-    return count
+
+    failed = 0
+    left_alone = 0
+    for row in candidates:
+        resolve, reason = _recovery_verdict(row, stale_cutoff)
+        if not resolve:
+            left_alone += 1
+            logger.info('Recovery sweep left analysis %s (%s) alone: %s',
+                        row['analysis_id'], row['status'], reason)
+            continue
+
+        # Re-assert the status predicate: between the SELECT above and this
+        # UPDATE the owning process may have finished the job itself.
+        failed += retry_on_lock(
+            lambda pk=row['analysis_id']: AnalysisResult.objects.filter(
+                pk=pk, status__in=(STATUS_RUNNING, STATUS_QUEUED),
+            ).update(
+                status=STATUS_FAILED,
+                stage='failed',
+                error_message=INTERRUPTED_MESSAGE,
+                end_time=now,
+                # Same reasoning as _mark_failed: an interrupted run is never
+                # getting a PDF, so the column must not be left promising one.
+                report_status=REPORT_SKIPPED,
+            ),
+            f'failing interrupted analysis {row["analysis_id"]}',
+        )
+        logger.info('Recovery sweep failed analysis %s (%s): %s',
+                    row['analysis_id'], row['status'], reason)
+
+    if failed:
+        logger.warning('Marked %d interrupted analysis job(s) as failed',
+                       failed)
+    if left_alone:
+        logger.info('Recovery sweep left %d in-flight analysis job(s) owned '
+                    'by other live processes untouched', left_alone)
+    return failed
 
 
 def _bootstrap():
@@ -808,12 +1327,50 @@ def _bootstrap():
         _close_connections()
 
 
+#: Set the first time :func:`start_bootstrap` actually starts the thread.
+#:
+#: ``AppConfig.ready()`` is not contractually once-per-process: calling
+#: ``django.setup()`` again, re-populating the app registry, or importing the
+#: project from a script that has already been set up will all fire it a
+#: second time.  Two bootstraps would mean two ``recover_interrupted_jobs()``
+#: sweeps (the second one able to fail a job the first one's warm-up just let
+#: through) and two concurrent torch loads.  The flag is process-local, which
+#: is the right scope: under the autoreloader the parent and child are
+#: separate processes and are separated by ``RUN_MAIN`` in
+#: :func:`is_serving_context` instead, and a reload re-execs the child, which
+#: *should* sweep again.
+_bootstrap_started = False
+_bootstrap_lock = threading.Lock()
+
+
 def start_bootstrap():
-    """Spawn the boot thread. Returns it, or ``None`` when not applicable."""
+    """
+    Spawn the boot thread. Returns it, or ``None`` when not applicable.
+
+    Idempotent: only the first call in a process starts anything.
+    """
+    global _bootstrap_started
+
     if not should_bootstrap():
         return None
+
+    with _bootstrap_lock:
+        if _bootstrap_started:
+            logger.debug('Analysis worker bootstrap already ran in this '
+                         'process; skipping')
+            return None
+        _bootstrap_started = True
+
     thread = threading.Thread(
         target=_bootstrap, name='asg-worker-bootstrap', daemon=True,
     )
     thread.start()
     return thread
+
+
+def reset_bootstrap_state():
+    """Forget that bootstrap ran — test support only, never called at runtime."""
+    global _bootstrap_started
+
+    with _bootstrap_lock:
+        _bootstrap_started = False

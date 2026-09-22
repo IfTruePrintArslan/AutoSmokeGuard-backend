@@ -7,8 +7,29 @@ reportlab into a single downloadable file.
 
 The relationship to ``AnalysisResult`` is one-to-one.  Re-generating a report
 for the same analysis overwrites the existing row and file rather than piling
-up copies, which keeps "download my report" unambiguous and means deleting an
-analysis disposes of exactly one PDF.
+up copies, which keeps "download my report" unambiguous and means there is
+never more than one PDF per analysis to account for.
+
+.. warning::
+   Deleting a row here — or letting the ``AnalysisResult`` /
+   ``UploadedMedia`` cascade delete it — does **not** remove that PDF.  The
+   file lives in a tree Django knows nothing about
+   (``MEDIA_ROOT/reports/<report_id>.pdf``; ``report_path`` is a plain
+   ``CharField``, not a ``FileField``), and this row is the only pointer to
+   it.  A deleting caller must resolve the paths *before* the delete and
+   reclaim them *after* it commits::
+
+       from analysis.services import artifact_paths_for_media
+       from common.storage import delete_paths
+
+       leftovers = artifact_paths_for_media(media)
+       media.delete()
+       delete_paths(leftovers)
+
+   ``analysis.services.delete_analysis`` already does this for the
+   single-analysis path.  The earlier version of this docstring claimed
+   deleting an analysis "disposes of exactly one PDF"; it disposed of zero
+   (review finding F6).
 
 Views and serializers are owned by the reports API agent; this module is the
 schema only.

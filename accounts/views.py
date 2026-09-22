@@ -18,6 +18,7 @@ import logging
 
 from django.conf import settings
 from django.contrib.auth.models import update_last_login
+from django.db import IntegrityError, transaction
 from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -111,11 +112,28 @@ class RegisterView(APIView):
         tags=['Auth'],
     )
     def post(self, request):
+        """
+        Create the account, or answer ``400 email_exists``.
+
+        The ``.exists()` probe below is a *fast path*, not the guarantee: two
+        submissions of the same form 50 ms apart both pass it, and the loser
+        used to hit the UNIQUE index with an uncaught ``IntegrityError`` and
+        return 500 instead of the contract's 400 (review finding F20a).
+
+        The insert is therefore wrapped in its own ``atomic()`` block and the
+        constraint violation is caught.  The ``atomic()`` is not decoration:
+        an ``IntegrityError`` poisons the surrounding transaction, so without
+        a savepoint to roll back to, every subsequent query on this
+        connection — including the ones DRF makes while rendering the 400 —
+        raises ``TransactionManagementError``.  The savepoint makes the
+        failed INSERT disappear and leaves the connection usable.
+        """
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         email = serializer.validated_data['email']
-        if User.objects.filter(email__iexact=email).exists():
+
+        def email_taken():
             return error_response(
                 'An account with this email already exists.',
                 'email_exists',
@@ -123,12 +141,24 @@ class RegisterView(APIView):
                 errors={'email': ['An account with this email already exists.']},
             )
 
-        user = User.objects.create_user(
-            email=email,
-            password=serializer.validated_data['password'],
-            full_name=serializer.validated_data.get('full_name', ''),
-            role=ROLE_USER,
-        )
+        if User.objects.filter(email__iexact=email).exists():
+            return email_taken()
+
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    email=email,
+                    password=serializer.validated_data['password'],
+                    full_name=serializer.validated_data.get('full_name', ''),
+                    role=ROLE_USER,
+                )
+        except IntegrityError:
+            logger.info(
+                'Concurrent signup for %s lost the race for the unique '
+                'index; answering 400 email_exists.', email,
+            )
+            return email_taken()
+
         tokens = issue_tokens(user)
         logger.info('Registered new account %s', user.email)
         return Response(
@@ -223,12 +253,28 @@ class RefreshTokenView(APIView):
 
     Delegates the actual rotation/blacklist mechanics to SimpleJWT's own
     ``TokenRefreshSerializer`` — it already knows how to honour
-    ``ROTATE_REFRESH_TOKENS`` / ``BLACKLIST_AFTER_ROTATION`` and to re-check
-    the owning user is still active — and only reshapes the result: adds
-    ``access_expires_in``, and turns a rejected token into the project's
-    standard error envelope with ``code="token_not_valid"`` (SimpleJWT's own
-    ``TokenError`` is a bare ``Exception``, not a DRF one, so it is caught
-    here explicitly rather than left for the shared exception handler).
+    ``ROTATE_REFRESH_TOKENS`` / ``BLACKLIST_AFTER_ROTATION`` — and only
+    reshapes the result: adds ``access_expires_in``, and turns a rejected
+    token into the project's standard error envelope with
+    ``code="token_not_valid"``.
+
+    Two failure modes have to be caught by hand, because neither is a DRF
+    exception and the shared handler would therefore turn both into a 500:
+
+    * ``TokenError`` — SimpleJWT's own signalling class, a bare
+      ``Exception``: expired, malformed or blacklisted token.
+    * ``User.DoesNotExist`` — the serializer resolves the ``user_id`` claim
+      with ``get_user_model().objects.get(...)`` and lets the ORM's
+      ``DoesNotExist`` escape when the account behind a still-valid token
+      has been deleted.  Note what the serializer does *not* do: it never
+      catches that, so "is the owner still there?" is only a check from this
+      view's point of view because this view makes it one (review finding
+      F19 — the docstring used to claim the serializer re-checked the user,
+      and a routine account deletion 500'd with a logged traceback).
+
+    Both answer ``401 token_not_valid``, which is exactly what the SPA's
+    single-flight refresh interceptor is written against: it clears the
+    session and routes to the login screen instead of retrying forever.
     """
 
     permission_classes = [AllowAny]
@@ -249,6 +295,14 @@ class RefreshTokenView(APIView):
             jwt_serializer.is_valid(raise_exception=True)
         except TokenError as exc:
             logger.info('Refresh token rejected: %s', exc)
+            return error_response(
+                'Token is invalid or expired.', 'token_not_valid',
+                status.HTTP_401_UNAUTHORIZED,
+            )
+        except User.DoesNotExist:
+            # A token whose signature and expiry are both fine, but whose
+            # account has since been deleted.  Routine, not exceptional.
+            logger.info('Refresh token rejected: its account no longer exists.')
             return error_response(
                 'Token is invalid or expired.', 'token_not_valid',
                 status.HTTP_401_UNAUTHORIZED,
