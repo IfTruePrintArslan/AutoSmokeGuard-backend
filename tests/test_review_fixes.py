@@ -25,6 +25,7 @@ Conventions
   the assertion then checks.
 """
 import io
+import os
 import sys
 import threading
 import time
@@ -62,7 +63,75 @@ from .conftest import DEFAULT_TEST_PASSWORD, authenticate, make_jpeg_bytes
 
 User = get_user_model()
 
-CONTRACT_PATH = Path(__file__).resolve().parents[2] / 'API_CONTRACT.md'
+#: Name of the environment variable that points this suite at the contract.
+CONTRACT_ENV_VAR = 'ASG_CONTRACT_PATH'
+
+#: The root of *this* repository (backend/), i.e. the checkout root in CI.
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+
+
+def contract_candidates():
+    """
+    Every place ``API_CONTRACT.md`` may legitimately be, most specific first.
+
+    The contract is owned by the **umbrella** repository, not this one:
+    ``backend/`` is its own git repo, so a standalone checkout — which is how
+    CI clones it and how the README tells collaborators to work — has no
+    sibling umbrella tree at all.  The previous ``parents[2] /
+    'API_CONTRACT.md'`` only ever resolved because the author's ``backend/``
+    happens to sit inside ``FYP/``; on a runner it was a hard
+    ``FileNotFoundError``.
+
+    Deleting the guard was not an option (it is the only thing that catches
+    the frozen contract drifting away from what the server actually returns),
+    and neither was an unconditional skip (green, and verifying nothing).  So
+    the file is *searched for*, and when it genuinely is not there the test
+    says so in as many words — see :func:`read_contract_or_skip`.
+    """
+    candidates = []
+
+    override = os.environ.get(CONTRACT_ENV_VAR, '').strip()
+    if override:
+        supplied = Path(override).expanduser()
+        # Accept either the file itself or the directory that contains it,
+        # so `ASG_CONTRACT_PATH=$GITHUB_WORKSPACE/_umbrella` also works.
+        candidates += [supplied, supplied / 'API_CONTRACT.md']
+
+    candidates += [
+        # Vendored into this repo (if it is ever moved/copied here).
+        BACKEND_ROOT / 'API_CONTRACT.md',
+        # A sibling checkout made by CI (see .github/workflows/ci.yml).
+        BACKEND_ROOT / '_umbrella' / 'API_CONTRACT.md',
+        # The umbrella working copy: FYP/backend -> FYP/API_CONTRACT.md.
+        BACKEND_ROOT.parent / 'API_CONTRACT.md',
+        BACKEND_ROOT.parent / '_umbrella' / 'API_CONTRACT.md',
+    ]
+    return candidates
+
+
+def read_contract_or_skip():
+    """
+    The text of ``API_CONTRACT.md``, or an explicit *missing input* skip.
+
+    The skip message names the file, every path that was tried and the
+    environment variable that would supply it, so a skipped run reads as
+    "this guard did not run and here is how to make it run" rather than as a
+    pass.
+    """
+    tried = contract_candidates()
+    for candidate in tried:
+        if candidate.is_file():
+            return candidate.read_text(encoding='utf-8')
+
+    pytest.skip(
+        'MISSING INPUT (this is not a pass): API_CONTRACT.md was not found, '
+        'so the contract-drift guard below could not run. The contract lives '
+        'in the umbrella repository (IfTruePrintArslan/AutoSmokeGuard), not '
+        'in this one, so a standalone backend checkout does not contain it. '
+        'Looked in: ' + '; '.join(str(path) for path in tried) + '. Set '
+        + CONTRACT_ENV_VAR + ' to the file (or to the directory holding it) '
+        'to make this guard run.'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +662,17 @@ def test_f11_reported_size_matches_the_finished_file(auth_client):
     assert live.read_bytes().rstrip().endswith(b'%%EOF')
 
 
+@pytest.mark.skipif(
+    os.name != 'posix',
+    reason=(
+        'POSIX permission bits only: Windows has no mode word to assert on — '
+        'os.stat there synthesises 0o666/0o444 from the read-only attribute, '
+        'so this check would compare 0o666 against 0o644 and fail without '
+        'anything being wrong. The behaviour under test (a published PDF that '
+        'nginx can read) is a POSIX deployment concern; the ubuntu leg of the '
+        'CI matrix runs this for real.'
+    ),
+)
 @pytest.mark.django_db
 def test_f11_the_published_pdf_is_world_readable(auth_client):
     """
@@ -754,7 +834,7 @@ def test_f11_two_threads_regenerating_one_report_do_not_overlap(auth_client,
 
 def test_f16_the_contract_documents_the_deduplicated_response():
     """The frozen contract has to describe what the server actually does."""
-    contract = CONTRACT_PATH.read_text(encoding='utf-8')
+    contract = read_contract_or_skip()
 
     assert 'deduplicated' in contract, (
         'API_CONTRACT.md still freezes POST /api/upload at "201 MediaObj" '
