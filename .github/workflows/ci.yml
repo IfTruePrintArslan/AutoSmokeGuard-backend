@@ -71,7 +71,70 @@ jobs:
         # migration file being committed alongside it.
         run: python manage.py makemigrations --check --dry-run
 
+      # --- cross-repo input for the API contract drift guard -------------
+      #
+      # tests/test_review_fixes.py has one guard
+      # (test_f16_the_contract_documents_the_deduplicated_response) that reads
+      # API_CONTRACT.md and asserts the frozen contract still describes what
+      # the server actually returns. That file lives in the **umbrella**
+      # repository (IfTruePrintArslan/AutoSmokeGuard); backend/ is its own git
+      # repo and a standalone checkout does not contain it, which is why the
+      # guard's old `parents[2] / 'API_CONTRACT.md'` was a FileNotFoundError
+      # here while passing on a machine where backend/ happens to sit inside
+      # FYP/. The test now looks the file up (ASG_CONTRACT_PATH first) and
+      # skips with an explicit "MISSING INPUT" message when it is absent —
+      # this step is what stops that skip from being the permanent state.
+      #
+      # ---------------------------------------------------------------------
+      # ACTION REQUIRED BY THE REPO OWNER FOR THIS GUARD TO ACTUALLY RUN
+      # ---------------------------------------------------------------------
+      # The umbrella repo is PRIVATE, and the automatic `secrets.GITHUB_TOKEN`
+      # is scoped to *this* repository only — it cannot read another private
+      # repo, no matter what permissions are granted here. So with nothing
+      # configured, the checkout below fails, `continue-on-error: true` keeps
+      # the build green, and the contract guard degrades to its explicit skip.
+      # That is the honest status quo: the guard is inert until someone adds
+      # the credential.
+      #
+      # To make it run for real, add a repository (or organisation) secret
+      # named SIBLING_REPO_TOKEN containing a token that can read
+      # IfTruePrintArslan/AutoSmokeGuard:
+      #   * a fine-grained PAT with `Contents: read` on that repo, or
+      #   * a classic PAT with the `repo` scope, or
+      #   * a GitHub App installation token with contents:read on both repos.
+      # Nothing else needs to change: the expression below already prefers
+      # SIBLING_REPO_TOKEN and falls back to GITHUB_TOKEN when it is absent,
+      # and the "did the guard run" step afterwards reports which way it went.
+      - name: Check out the umbrella repo (supplies API_CONTRACT.md)
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: IfTruePrintArslan/AutoSmokeGuard
+          path: _umbrella
+          token: ${{ secrets.SIBLING_REPO_TOKEN || secrets.GITHUB_TOKEN }}
+          # This checkout exists only to be read by a test; leaving its
+          # credentials in _umbrella/.git/config would serve no purpose.
+          persist-credentials: false
+
+      - name: Report whether the contract drift guard has its input
+        # Makes the degradation visible in the log instead of silent: a skip
+        # that nobody notices is indistinguishable from a passing guard.
+        shell: bash
+        run: |
+          if [ -f "_umbrella/API_CONTRACT.md" ]; then
+            echo "API_CONTRACT.md found -> the contract drift guard will RUN."
+          else
+            # One physical line on purpose: a ::warning:: workflow command is
+            # terminated by the first newline.
+            echo "::warning title=Contract drift guard inactive::API_CONTRACT.md was not checked out, so the contract drift guard in tests/test_review_fixes.py will SKIP instead of verifying the contract. The umbrella repo is private; add a SIBLING_REPO_TOKEN secret that can read it (see the comment above this step in .github/workflows/ci.yml)."
+          fi
+
       - name: Run tests with coverage
+        env:
+          # Points the guard at the sibling checkout above. When that checkout
+          # did not happen the path simply does not exist, the test's own
+          # candidate search comes up empty, and it skips loudly.
+          ASG_CONTRACT_PATH: ${{ github.workspace }}/_umbrella/API_CONTRACT.md
         run: pytest -q --cov
 
       - name: Validate OpenAPI schema

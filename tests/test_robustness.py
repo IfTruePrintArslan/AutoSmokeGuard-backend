@@ -23,6 +23,8 @@ import math
 import os
 import socket
 import stat
+import subprocess
+import sys
 import uuid
 from datetime import timedelta
 
@@ -55,6 +57,20 @@ from uploads.services import (
 
 ANALYZE_URL_NAME = 'analysis-analyze'
 UPLOAD_URL_NAME = 'media-upload'
+
+#: Windows runs this suite too (see .github/workflows/ci.yml's os matrix), and
+#: half the ``os`` module simply does not exist there.  These two are computed
+#: once, at import time, because they are used in ``skipif`` marks — and a mark
+#: is evaluated during *collection*, so ``os.geteuid() == 0`` written inline
+#: raises ``AttributeError`` on Windows before a single test in this module has
+#: a chance to run (pytest reports it as a collection error and then aborts the
+#: whole session, which is exactly how ~41 tests here went missing on the
+#: windows-latest leg).  The short-circuit below is load-bearing, and it is
+#: deliberately doubled: ``os.name`` is the real answer, ``hasattr`` is the
+#: one that still holds if some future interpreter/runner reports a POSIX
+#: ``os.name`` without shipping the credential calls.
+ON_POSIX = os.name == 'posix'
+RUNNING_AS_ROOT = ON_POSIX and hasattr(os, 'geteuid') and os.geteuid() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -122,14 +138,30 @@ def a_dead_pid():
     """
     A pid that is guaranteed not to be running.
 
-    ``os.fork`` + immediate ``_exit`` + ``waitpid`` reaps the child, so the
-    pid is genuinely gone rather than merely unlikely to exist.
+    On POSIX, ``os.fork`` + immediate ``_exit`` + ``waitpid`` reaps the child,
+    so the pid is genuinely gone rather than merely unlikely to exist.
+
+    ``os.fork`` does not exist on Windows at all (the attribute lookup itself
+    is an ``AttributeError``), so the same guarantee is bought there with a
+    real child process: once ``wait()`` has returned, that process has
+    provably exited.  It costs an interpreter start-up, which is why it is not
+    the implementation everywhere — but it is a *real* dead pid either way, so
+    the test below still asserts on evidence rather than on a pid nobody
+    happens to be using.
     """
-    pid = os.fork()
-    if pid == 0:                                      # pragma: no cover - child
-        os._exit(0)
-    os.waitpid(pid, 0)
-    return pid
+    if hasattr(os, 'fork'):
+        pid = os.fork()
+        if pid == 0:                                  # pragma: no cover - child
+            os._exit(0)
+        os.waitpid(pid, 0)
+        return pid
+
+    child = subprocess.Popen(                    # pragma: no cover - Windows
+        [sys.executable, '-c', ''],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    child.wait()
+    return child.pid
 
 
 class FakeCapture:
@@ -160,6 +192,12 @@ def fake_capture(monkeypatch):
     only way to exercise that branch is to control what the demuxer says.
     Everything else in :func:`probe_video` — including the code under test —
     is the real, unmodified function.
+
+    The ``/tmp/...`` paths the tests below pass in are **not** a POSIX
+    dependency and are portable as written: with ``cv2.VideoCapture`` replaced
+    here, ``probe_video`` only ever interpolates that argument into a log
+    message, so no file is opened, stat'ed or created. The literals are
+    deliberately absurd (``does-not-need-to-exist.mp4``) to say so.
     """
     import cv2
 
@@ -367,8 +405,20 @@ def readonly_media_root(tmp_media):
         os.chmod(tmp_media, original)
 
 
-@pytest.mark.skipif(os.geteuid() == 0,
-                    reason='root ignores the write bit, so chmod proves nothing')
+@pytest.mark.skipif(
+    not ON_POSIX,
+    reason=(
+        'needs a directory that genuinely refuses writes: os.chmod on Windows '
+        'only toggles the read-only attribute, which NTFS ignores for '
+        'directories, so the PermissionError this test exists to provoke '
+        'cannot be created there (and os.geteuid does not exist either). The '
+        'ubuntu leg of the CI matrix runs it for real.'
+    ),
+)
+@pytest.mark.skipif(
+    RUNNING_AS_ROOT,
+    reason='root ignores the write bit, so chmod proves nothing',
+)
 @pytest.mark.django_db
 def test_defect3_readonly_media_root_returns_503_not_500(
         auth_client, settings_row, sample_files, readonly_media_root):
