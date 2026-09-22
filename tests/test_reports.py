@@ -1,0 +1,586 @@
+"""
+Tests for the reports API (UC-07): ``reports.services.generate_report_for_
+analysis`` plus the ``GET /api/report/{id}``, ``GET /api/download-report/
+{id}`` and ``GET /api/reports`` endpoints.
+
+Fixtures build an ``AnalysisResult`` (with ``DetectedVehicle``/``SmokeRegion``
+children) directly through the ORM — the ML pipeline is out of scope here,
+only the report built from its *output* is under test. Test names carry the
+project's TC ids where the task brief assigns one (``TC-10``..``TC-13``); the
+rest cover force-regeneration semantics, ownership, edge cases and the UC-07
+30-second NFR.
+"""
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.utils import timezone
+from PIL import Image
+
+from analysis.models import (
+    STATUS_DONE,
+    STATUS_RUNNING,
+    AnalysisResult,
+    DetectedVehicle,
+    SmokeRegion,
+    default_severity_counts,
+)
+from common.storage import analysis_artifact_dir, from_media_relative
+from reports.models import GeneratedReport
+from reports.services import ReportNotReady, generate_report_for_analysis
+from uploads.models import UploadedMedia
+
+from .conftest import make_jpeg_bytes, make_mp4_bytes
+
+REPORT_URL = '/api/report/{}'
+DOWNLOAD_URL = '/api/download-report/{}'
+LIST_URL = '/api/reports'
+
+VEHICLE_TYPES = ('car', 'truck', 'bus', 'motorcycle')
+SEVERITIES = ('low', 'moderate', 'high')
+
+
+# ---------------------------------------------------------------------------
+# Fixture builders — real ORM rows, no ML pipeline involved.
+# ---------------------------------------------------------------------------
+
+def _make_media(user, filename='clip.mp4', kind='video'):
+    """A genuine ``UploadedMedia`` row, with a real (small) file on disk."""
+    if kind == 'video':
+        data = make_mp4_bytes()
+        upload = SimpleUploadedFile(filename, data, content_type='video/mp4')
+        return UploadedMedia.objects.create(
+            user=user, filename=filename, format='mp4', media_type='video',
+            size_bytes=len(data), file=upload, width=1280, height=720,
+            duration_seconds=12.5,
+        )
+    data = make_jpeg_bytes()
+    upload = SimpleUploadedFile(filename, data, content_type='image/jpeg')
+    return UploadedMedia.objects.create(
+        user=user, filename=filename, format='jpg', media_type='image',
+        size_bytes=len(data), file=upload, width=1280, height=720,
+    )
+
+
+def _make_analysis(user, media=None, status=STATUS_DONE, **overrides):
+    """A bare ``AnalysisResult`` — no vehicles yet, see :func:`_populate_vehicles`."""
+    media = media or _make_media(user)
+    now = timezone.now()
+    defaults = dict(
+        media=media, user=user, status=status,
+        progress=100 if status == STATUS_DONE else 40,
+        stage='' if status == STATUS_DONE else 'segmenting frames',
+        start_time=now, end_time=now if status == STATUS_DONE else None,
+        total_vehicles=0, total_smoke=0, frames_processed=1,
+        avg_confidence=0.0, overall_severity='',
+        severity_counts=default_severity_counts(),
+        settings_snapshot={
+            'confidence_threshold': 0.35, 'smoke_mask_threshold': 0.5,
+            'severity_low_max': 0.33, 'severity_moderate_max': 0.66,
+            'frame_sample_rate': 5, 'max_video_seconds': 300,
+        },
+    )
+    defaults.update(overrides)
+    return AnalysisResult.objects.create(**defaults)
+
+
+def _add_vehicle(analysis, vehicle_type='car', confidence=0.9, frame_number=1,
+                  timestamp=1.0, smoke=None):
+    vehicle = DetectedVehicle.objects.create(
+        analysis=analysis, vehicle_type=vehicle_type,
+        bounding_box={'x': 10, 'y': 10, 'w': 100, 'h': 80},
+        confidence=confidence, frame_number=frame_number,
+        timestamp_seconds=timestamp,
+    )
+    if smoke is not None:
+        SmokeRegion.objects.create(vehicle=vehicle, **smoke)
+    return vehicle
+
+
+def _populate_vehicles(analysis, count, with_smoke=True):
+    """Add *count* vehicles (roughly half smoking, cycling through severities)."""
+    counts = {'low': 0, 'moderate': 0, 'high': 0}
+    for i in range(count):
+        smoke = None
+        if with_smoke and i % 2 == 0:
+            severity = SEVERITIES[i % 3]
+            smoke = dict(
+                intensity=round(0.2 + (i % 3) * 0.3, 3), severity=severity,
+                confidence=0.8, area_ratio=round(0.1 + 0.01 * i, 3),
+                opacity=0.5, mask_path='',
+            )
+            counts[severity] += 1
+        _add_vehicle(
+            analysis, vehicle_type=VEHICLE_TYPES[i % len(VEHICLE_TYPES)],
+            confidence=round(0.5 + (i % 5) * 0.09, 3),
+            frame_number=i, timestamp=float(i), smoke=smoke,
+        )
+
+    analysis.total_vehicles = count
+    analysis.total_smoke = sum(counts.values())
+    analysis.severity_counts = counts
+    if counts['high']:
+        analysis.overall_severity = 'high'
+    elif counts['moderate']:
+        analysis.overall_severity = 'moderate'
+    elif counts['low']:
+        analysis.overall_severity = 'low'
+    analysis.avg_confidence = 0.8
+    analysis.frames_processed = max(count, 1)
+    analysis.save()
+    return counts
+
+
+def _write_frame(analysis, frame_number, size=(640, 480), colour=(80, 120, 160)):
+    """A real, decodable annotated frame under ``analyses/<id>/frames/``."""
+    frames_dir = analysis_artifact_dir(analysis.analysis_id, 'frames')
+    path = frames_dir / f'frame_{frame_number:06d}.jpg'
+    Image.new('RGB', size, colour).save(path, format='JPEG')
+    return path
+
+
+# ===========================================================================
+# TC-10 — a report for an analysis that is not done yet
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestTC10ReportNotReady:
+
+    def test_generate_report_raises_for_running_analysis(self, auth_client):
+        analysis = _make_analysis(auth_client.user, status=STATUS_RUNNING, end_time=None)
+
+        with pytest.raises(ReportNotReady) as exc_info:
+            generate_report_for_analysis(analysis)
+
+        assert 'not ready' in str(exc_info.value).lower()
+        assert not GeneratedReport.objects.filter(analysis=analysis).exists()
+
+    def test_download_surfaces_409_report_not_ready(self, auth_client):
+        """
+        The download endpoint regenerates a report whose file has gone
+        missing from disk. If the underlying analysis has since regressed out
+        of 'done' (a race in principle, exercised directly here), that
+        regeneration attempt must surface the same 409 envelope, not a 500.
+        """
+        analysis = _make_analysis(auth_client.user, status=STATUS_DONE)
+        report = generate_report_for_analysis(analysis)
+        from_media_relative(report.report_path).unlink()
+        AnalysisResult.objects.filter(pk=analysis.pk).update(
+            status=STATUS_RUNNING, end_time=None,
+        )
+
+        response = auth_client.get(DOWNLOAD_URL.format(report.report_id))
+
+        assert response.status_code == 409
+        assert response.data['code'] == 'report_not_ready'
+        assert 'not ready' in response.data['detail'].lower()
+
+
+# ===========================================================================
+# TC-11 — generate_report_for_analysis produces a real file and row
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestTC11GenerateReport:
+
+    def test_produces_file_on_disk_and_a_populated_row(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        _populate_vehicles(analysis, 5)
+
+        report = generate_report_for_analysis(analysis)
+
+        assert isinstance(report, GeneratedReport)
+        assert report.analysis_id == analysis.analysis_id
+        assert report.page_count > 0
+        assert report.file_size_bytes > 0
+
+        absolute = from_media_relative(report.report_path)
+        assert absolute.is_file()
+        assert absolute.stat().st_size == report.file_size_bytes
+        assert absolute.read_bytes()[:4] == b'%PDF'
+
+
+# ===========================================================================
+# TC-12 — GET /api/download-report/{id}
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestTC12Download:
+
+    def test_download_ok(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        _populate_vehicles(analysis, 3)
+        report = generate_report_for_analysis(analysis)
+
+        response = auth_client.get(DOWNLOAD_URL.format(report.report_id))
+
+        assert response.status_code == 200
+        assert response['Content-Type'] == 'application/pdf'
+        assert 'attachment' in response['Content-Disposition']
+        assert f'{str(report.report_id)[:8]}' in response['Content-Disposition']
+
+        body = b''.join(response.streaming_content)
+        assert body[:4] == b'%PDF'
+
+
+# ===========================================================================
+# TC-13 — unknown report id
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestTC13UnknownReport:
+
+    def test_unknown_id_json_404(self, auth_client):
+        response = auth_client.get(REPORT_URL.format(uuid.uuid4()))
+
+        assert response.status_code == 404
+        assert response.data['code'] == 'report_not_found'
+
+    def test_unknown_id_download_404(self, auth_client):
+        response = auth_client.get(DOWNLOAD_URL.format(uuid.uuid4()))
+
+        assert response.status_code == 404
+        assert response.data['code'] == 'report_not_found'
+
+
+# ===========================================================================
+# Ownership — another user's report is invisible; an admin can see everything.
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestOwnership:
+
+    def test_other_users_report_is_404_for_json_and_download(self, auth_client, user_factory):
+        owner = user_factory()
+        analysis = _make_analysis(owner)
+        report = generate_report_for_analysis(analysis)
+
+        json_response = auth_client.get(REPORT_URL.format(report.report_id))
+        download_response = auth_client.get(DOWNLOAD_URL.format(report.report_id))
+
+        assert json_response.status_code == 404
+        assert json_response.data['code'] == 'report_not_found'
+        assert download_response.status_code == 404
+        assert download_response.data['code'] == 'report_not_found'
+
+    def test_admin_can_fetch_another_users_report(self, admin_client, user_factory):
+        owner = user_factory()
+        analysis = _make_analysis(owner)
+        _populate_vehicles(analysis, 2)
+        report = generate_report_for_analysis(analysis)
+
+        response = admin_client.get(REPORT_URL.format(report.report_id))
+
+        assert response.status_code == 200
+        assert response.data['report_id'] == str(report.report_id)
+        assert response.data['analysis']['analysis_id'] == str(analysis.analysis_id)
+
+    def test_admin_can_download_another_users_report(self, admin_client, user_factory):
+        owner = user_factory()
+        analysis = _make_analysis(owner)
+        report = generate_report_for_analysis(analysis)
+
+        response = admin_client.get(DOWNLOAD_URL.format(report.report_id))
+
+        assert response.status_code == 200
+
+
+# ===========================================================================
+# force=True / force=False semantics
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestForceRegeneration:
+
+    def test_force_false_returns_existing_row_unchanged(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        first = generate_report_for_analysis(analysis)
+        first_path = from_media_relative(first.report_path)
+        first_mtime = first_path.stat().st_mtime
+
+        second = generate_report_for_analysis(analysis, force=False)
+
+        assert second.report_id == first.report_id
+        assert first_path.stat().st_mtime == first_mtime
+
+    def test_force_true_regenerates_and_replaces_the_file(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        first = generate_report_for_analysis(analysis)
+        first_bytes = from_media_relative(first.report_path).read_bytes()
+
+        _populate_vehicles(analysis, 4)
+        second = generate_report_for_analysis(analysis, force=True)
+        second_bytes = from_media_relative(second.report_path).read_bytes()
+
+        assert second.report_id == first.report_id  # same row, same on-disk path
+        assert second_bytes != first_bytes
+        assert GeneratedReport.objects.filter(analysis=analysis).count() == 1
+
+
+# ===========================================================================
+# Edge cases that must not crash
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestEdgeCases:
+
+    def test_zero_vehicles_still_produces_a_valid_pdf(self, auth_client):
+        analysis = _make_analysis(auth_client.user)  # no vehicles added
+
+        report = generate_report_for_analysis(analysis)
+        raw = from_media_relative(report.report_path).read_bytes()
+
+        assert raw.startswith(b'%PDF-')
+        assert raw.rstrip().endswith(b'%%EOF')
+        assert report.page_count >= 1
+
+    def test_vehicles_without_smoke_do_not_crash(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        _populate_vehicles(analysis, 4, with_smoke=False)
+
+        report = generate_report_for_analysis(analysis)
+
+        assert report.page_count > 0
+        assert analysis.total_smoke == 0
+
+    def test_missing_annotated_frames_directory_is_skipped(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        _populate_vehicles(analysis, 3)
+        # No analyses/<id>/frames/ directory is ever created on disk.
+
+        report = generate_report_for_analysis(analysis)
+
+        assert report.page_count > 0
+
+    def test_corrupt_frame_file_is_skipped_gracefully(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        _populate_vehicles(analysis, 2)
+        frames_dir = analysis_artifact_dir(analysis.analysis_id, 'frames')
+        (frames_dir / 'frame_000001.jpg').write_bytes(b'not actually a jpeg')
+        _write_frame(analysis, 2)  # one genuine frame alongside the corrupt one
+
+        report = generate_report_for_analysis(analysis)
+
+        assert report.page_count > 0
+
+    def test_missing_preview_image_is_skipped(self, auth_client):
+        analysis = _make_analysis(auth_client.user, preview_path='analyses/does-not-exist/preview.jpg')
+        _populate_vehicles(analysis, 1)
+
+        report = generate_report_for_analysis(analysis)
+
+        assert report.page_count > 0
+
+    def test_extremely_long_filename_does_not_crash(self, auth_client):
+        long_name = ('x' * 300) + '.jpg'
+        media = _make_media(auth_client.user, filename=long_name, kind='image')
+        analysis = _make_analysis(auth_client.user, media=media)
+        _populate_vehicles(analysis, 1)
+
+        report = generate_report_for_analysis(analysis)
+
+        assert report.page_count > 0
+
+    def test_prefers_the_worker_stashed_runtime_metadata(self, auth_client):
+        """
+        When the analysis worker has stashed device/segmenter_mode/annotated
+        frames under settings_snapshot['_runtime'] (see analysis.services
+        .RUNTIME_KEY), the report should use that authoritative, per-run data
+        rather than guessing the current render-time device.
+        """
+        media = _make_media(auth_client.user, kind='video')
+        analysis = _make_analysis(auth_client.user, media=media)
+        _populate_vehicles(analysis, 2)
+        frame_path = _write_frame(analysis, 0)
+        relative_frame = str(
+            Path('analyses') / str(analysis.analysis_id) / 'frames' / frame_path.name
+        )
+        snapshot = dict(analysis.settings_snapshot)
+        snapshot['_runtime'] = {
+            'device': 'mps', 'segmenter_mode': 'unet',
+            'annotated_frames': [relative_frame],
+        }
+        analysis.settings_snapshot = snapshot
+        analysis.save(update_fields=['settings_snapshot'])
+
+        report = generate_report_for_analysis(analysis)
+
+        assert report.page_count > 0
+
+    def test_deleted_pdf_is_regenerated_on_download(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        _populate_vehicles(analysis, 2)
+        report = generate_report_for_analysis(analysis)
+        absolute = from_media_relative(report.report_path)
+        absolute.unlink()
+        assert not absolute.is_file()
+
+        response = auth_client.get(DOWNLOAD_URL.format(report.report_id))
+
+        assert response.status_code == 200
+        assert absolute.is_file()
+        body = b''.join(response.streaming_content)
+        assert body[:4] == b'%PDF'
+
+
+# ===========================================================================
+# NFR — a report must be produced within 30 seconds (UC-07).
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestNFRTiming:
+
+    def test_thirty_vehicles_six_frames_within_budget(self, auth_client):
+        media = _make_media(auth_client.user, kind='video')
+        analysis = _make_analysis(auth_client.user, media=media)
+        _populate_vehicles(analysis, 30)
+        for i in range(6):
+            _write_frame(analysis, i)
+
+        started = time.monotonic()
+        report = generate_report_for_analysis(analysis)
+        elapsed = time.monotonic() - started
+
+        print(f'\n[NFR] report for 30 vehicles / 6 frames took {elapsed:.2f}s '
+              f'({report.page_count} pages, {report.file_size_bytes} bytes)')
+
+        assert elapsed < 30
+        assert report.page_count > 0
+
+
+# ===========================================================================
+# Structural parse-back — no pypdf installed, so this asserts on raw bytes.
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestPdfStructure:
+
+    def test_page_count_matches_raw_page_object_count(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        _populate_vehicles(analysis, 60)  # enough rows to force a page break
+
+        report = generate_report_for_analysis(analysis)
+        raw = from_media_relative(report.report_path).read_bytes()
+
+        assert raw.startswith(b'%PDF-')
+        assert b'/Type /Page' in raw
+        assert raw.rstrip().endswith(b'%%EOF')
+
+        # '/Type /Page' is a substring of the single '/Type /Pages' container
+        # object too, so it is subtracted out to get the real page count.
+        page_objects = raw.count(b'/Type /Page') - raw.count(b'/Type /Pages')
+        assert page_objects == report.page_count
+        assert report.page_count > 1  # 60 detection rows must have paginated
+
+
+# ===========================================================================
+# GET /api/reports — pagination and per-user scoping
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestListEndpoint:
+
+    def test_paginates_and_only_shows_the_callers_reports(self, auth_client, user_factory):
+        other = user_factory()
+        mine_ids = set()
+        for i in range(3):
+            media = _make_media(auth_client.user, filename=f'mine-{i}.jpg', kind='image')
+            analysis = _make_analysis(auth_client.user, media=media)
+            report = generate_report_for_analysis(analysis)
+            mine_ids.add(str(report.report_id))
+
+        other_analysis = _make_analysis(other)
+        generate_report_for_analysis(other_analysis)
+
+        response = auth_client.get(LIST_URL, {'page': 1, 'page_size': 2})
+
+        assert response.status_code == 200
+        body = response.data
+        assert {'count', 'page', 'pages', 'page_size', 'next', 'previous', 'results'} <= set(body)
+        assert body['count'] == 3
+        assert body['page_size'] == 2
+        assert len(body['results']) == 2
+        for row in body['results']:
+            assert row['report_id'] in mine_ids
+            # Slim nested analysis summary, not the full AnalysisDetail.
+            assert set(row['analysis']) == {
+                'analysis_id', 'overall_severity', 'total_vehicles',
+                'total_smoke', 'media',
+            }
+            assert 'vehicles' not in row['analysis']
+            assert 'settings_snapshot' not in row['analysis']
+
+        second_page = auth_client.get(LIST_URL, {'page': 2, 'page_size': 2})
+        assert second_page.status_code == 200
+        assert len(second_page.data['results']) == 1
+
+    def test_row_analysis_summary_has_filename_and_severity(self, auth_client):
+        """
+        The fields the Reports screen actually renders: source filename and
+        overall severity, both of which only exist inside the nested
+        analysis — this is the G16 fix, replacing the old bare ReportObj
+        that forced the frontend to fall back to '—' placeholders.
+        """
+        media = _make_media(auth_client.user, filename='smoking-truck.mp4', kind='video')
+        analysis = _make_analysis(auth_client.user, media=media)
+        _populate_vehicles(analysis, 5)
+        report = generate_report_for_analysis(analysis)
+
+        response = auth_client.get(LIST_URL)
+
+        assert response.status_code == 200
+        row = next(r for r in response.data['results'] if r['report_id'] == str(report.report_id))
+        assert row['analysis']['analysis_id'] == str(analysis.analysis_id)
+        assert row['analysis']['overall_severity'] == analysis.overall_severity
+        assert row['analysis']['total_vehicles'] == analysis.total_vehicles
+        assert row['analysis']['total_smoke'] == analysis.total_smoke
+        assert row['analysis']['media'] == {
+            'media_id': str(media.media_id),
+            'filename': 'smoking-truck.mp4',
+            'media_type': 'video',
+        }
+
+    def test_row_analysis_summary_severity_is_null_not_empty_string(self, auth_client):
+        """
+        `overall_severity` is stored as `''` on the model until anything is
+        detected; the wire value must be `null`, matching the severity
+        vocabulary (`"low"|"moderate"|"high"`), not an empty string.
+        """
+        analysis = _make_analysis(auth_client.user)  # no vehicles -> overall_severity == ''
+        assert analysis.overall_severity == ''
+        report = generate_report_for_analysis(analysis)
+
+        response = auth_client.get(LIST_URL)
+
+        row = next(r for r in response.data['results'] if r['report_id'] == str(report.report_id))
+        assert row['analysis']['overall_severity'] is None
+
+    def test_list_endpoint_analysis_summary_has_no_n_plus_one(self, auth_client, django_assert_num_queries):
+        """
+        The nested `analysis` summary must not reintroduce an N+1: listing
+        one report and listing several must cost the exact same number of
+        queries, proving `_visible_reports`'s `select_related('analysis',
+        'analysis__media')` — not a per-row lookup — is what backs the
+        nested filename/severity/media fields.
+        """
+        def make_report(i):
+            media = _make_media(auth_client.user, filename=f'row-{i}.jpg', kind='image')
+            analysis = _make_analysis(auth_client.user, media=media)
+            _populate_vehicles(analysis, 2)
+            return generate_report_for_analysis(analysis)
+
+        make_report(0)
+        with django_assert_num_queries(3):
+            one_row_response = auth_client.get(LIST_URL, {'page_size': 50})
+        assert one_row_response.status_code == 200
+        assert one_row_response.data['count'] == 1
+
+        for i in range(1, 5):
+            make_report(i)
+
+        with django_assert_num_queries(3):
+            many_rows_response = auth_client.get(LIST_URL, {'page_size': 50})
+        assert many_rows_response.status_code == 200
+        assert many_rows_response.data['count'] == 5

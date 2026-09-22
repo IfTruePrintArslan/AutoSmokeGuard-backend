@@ -1,5 +1,61 @@
-asgiref==3.11.1
+# AutoSmokeGuard — backend dependencies
+#
+# What this file is
+# -----------------
+# The *direct* dependencies of the backend, grouped by the job they do, each
+# pinned to the exact version the project is developed and tested against on
+# Python 3.14.  Transitive packages are deliberately left unpinned so pip can
+# resolve them: pinning the full closure here would turn every upstream
+# security patch into a merge conflict.  If you need the fully-locked set for
+# a reproducible image, `pip freeze` in a clean venv built from this file.
+#
+# The groups are:
+#   web      Django, DRF and the middleware/schema layer around them
+#   ml       the vision stack the analysis pipeline runs on
+#   pdf      report rendering
+#   db       the PostgreSQL driver (SQLite needs nothing — stdlib)
+#   tooling  the test runner
+#
+# This is the *complete* runtime set: a clean `pip install -r requirements.txt`
+# gives you an environment that can serve the API, run the ML pipeline and
+# render reports.  `requirements-prod.txt` layers the production server (WSGI
+# server, process manager) on top of this file; it is maintained alongside the
+# Dockerfile and should be installed *in addition to*, never instead of, this
+# one.
+#
+# Install:  pip install -r requirements.txt
+
+# --- web / API -------------------------------------------------------------
 Django==6.0.6
-django-cors-headers==4.9.0
-djangorestframework==3.17.1
-sqlparse==0.5.5
+djangorestframework==3.18.1
+djangorestframework-simplejwt==5.5.1   # JWT auth + refresh-token blacklist
+django-cors-headers==4.9.0             # CORS for the Vite front end
+django-filter==26.1                    # query-param filtering on list views
+drf-spectacular==0.30.0                # OpenAPI 3 schema + Swagger UI
+whitenoise==6.12.0                     # static file serving from the WSGI app
+python-dotenv==1.2.3                   # loads backend/.env into os.environ
+
+# --- machine learning / computer vision ------------------------------------
+torch==2.14.0
+torchvision==0.29.0
+ultralytics==8.4.157                   # YOLO vehicle detection
+opencv-python==5.0.0.93                # frame extraction, mask post-processing
+numpy==2.5.3
+pillow==12.3.0                         # image decode/encode + upload probing
+
+# --- PDF reporting ---------------------------------------------------------
+reportlab==5.0.1
+
+# --- database --------------------------------------------------------------
+# SQLite (the zero-configuration default) needs no driver.  Setting
+# DATABASE_URL to a postgres:// URL switches config/settings.py over to
+# django.db.backends.postgresql, which imports psycopg 3 — without this line
+# that documented path fails at runtime with ImproperlyConfigured.  The
+# [binary] extra ships prebuilt libpq wheels, so no local PostgreSQL client
+# libraries or build toolchain are required.
+psycopg[binary]==3.3.6
+
+# --- tooling / tests -------------------------------------------------------
+pytest==9.1.1
+pytest-django==4.14.0
+pytest-cov==7.1.0
