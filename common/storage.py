@@ -26,6 +26,7 @@ Database columns such as ``AnalysisResult.preview_path`` and
 ``GeneratedReport.report_path`` always store the *relative* form, so media can
 be moved to another volume or an object store without rewriting rows.
 """
+import logging
 import os
 import posixpath
 import shutil
@@ -35,6 +36,8 @@ from pathlib import Path
 from django.conf import settings
 
 from .validators import file_extension
+
+logger = logging.getLogger('asg.storage')
 
 # Top-level trees inside MEDIA_ROOT.
 UPLOADS_DIR = 'uploads'
@@ -106,9 +109,67 @@ def smoke_mask_path(analysis_id, smoke_id, extension='png', create=True):
 
 
 def delete_analysis_artifacts(analysis_id):
-    """Remove an analysis's entire artefact tree; silent when already gone."""
+    """
+    Remove an analysis's entire artefact tree; silent when already gone.
+
+    Note what this does **not** cover: the analysis's generated PDF lives in
+    a different tree (``reports/<report_id>.pdf``), so a caller deleting an
+    analysis needs :func:`delete_paths` over
+    ``analysis.services.artifact_paths_for_analysis`` rather than this
+    function on its own.  Kept because the benchmarking tool wants exactly
+    "throw away the frames, keep the row".
+    """
     shutil.rmtree(analysis_artifact_dir(analysis_id, create=False),
                   ignore_errors=True)
+
+
+def delete_paths(paths):
+    """
+    Reclaim a batch of files and directory trees under ``MEDIA_ROOT``.
+
+    Accepts the mixed list that deleting an analysis produces — artefact
+    *directories* and report *files* — and dispatches per entry, so callers
+    do not have to remember which is which.  Absent entries are not an
+    error: the whole point of calling this is that the database rows which
+    pointed at them are already gone, and a half-reclaimed tree from an
+    earlier crash must not turn a 204 into a 500.
+
+    Anything resolving outside ``MEDIA_ROOT`` is refused and logged rather
+    than deleted.  Every path handed in today is derived from a database
+    column (``GeneratedReport.report_path``) or from an id, and
+    :func:`from_media_relative` already confines the former — but this
+    function's whole job is ``rmtree``/``unlink``, so it does not take that
+    on trust from its caller.
+
+    Returns the number of entries that existed and were removed.
+    """
+    root = os.path.normpath(os.path.abspath(str(_media_root())))
+    removed = 0
+
+    for entry in paths or ():
+        if entry is None:
+            continue
+        path = Path(entry)
+        resolved = os.path.normpath(os.path.abspath(str(path)))
+        if resolved != root and not resolved.startswith(root + os.sep):
+            logger.error(
+                'Refusing to delete %s: it is outside MEDIA_ROOT.', path,
+            )
+            continue
+
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 0 if path.exists() else 1
+            elif path.is_symlink() or path.exists():
+                path.unlink(missing_ok=True)
+                removed += 1
+        except OSError:
+            # Best effort by design: leaking bytes is recoverable, failing
+            # the delete request is not.
+            logger.warning('Could not reclaim %s', path, exc_info=True)
+
+    return removed
 
 
 # ---------------------------------------------------------------------------

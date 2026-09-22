@@ -91,6 +91,12 @@ class UploadView(APIView):
             201: UploadedMediaSerializer,
             200: UploadedMediaSerializer,
             400: OpenApiTypes.OBJECT,
+            # code="storage_unavailable" — the filesystem under MEDIA_ROOT
+            # refused the write (read-only mount, full disk, bad ownership).
+            # The request itself was valid and is worth retrying, which is
+            # why this is 503 and not 500.  See
+            # uploads.services._save_media_file (robustness finding §E).
+            503: OpenApiTypes.OBJECT,
         },
     )
     def post(self, request, *args, **kwargs):
@@ -195,6 +201,35 @@ class MediaDetailView(generics.RetrieveDestroyAPIView):
         return super().delete(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
+        """
+        Delete the upload, its analyses, their artefacts and their PDFs.
+
+        Reclaiming the artefacts is not optional book-keeping (review finding
+        ASG-R07).  The cascade ``UploadedMedia -> AnalysisResult ->
+        GeneratedReport`` destroys the *only* database pointers to
+        ``MEDIA_ROOT/analyses/<analysis_id>/`` (preview, crops, masks,
+        annotated frames) and ``MEDIA_ROOT/reports/<report_id>.pdf``.  Left
+        alone, those files become unreferenced and unreachable — ``MEDIA_ROOT``
+        grows monotonically with no operator-visible way to reclaim it, and
+        the report PDF in particular survives as an unreferenced copy of data
+        the user asked to have deleted.
+
+        The ordering below is the whole fix and each step has to stay where
+        it is:
+
+        1. **Resolve the paths first.**  After the cascade the rows are gone
+           and the paths are unrecoverable.
+        2. **Delete the rows.**
+        3. **Reclaim the bytes last**, after the delete has committed, and
+           best-effort.  A rollback must never be able to leave live rows
+           pointing at files that are already gone, and a failed unlink must
+           never turn a successful 204 into a 500 — leaking a few megabytes
+           is recoverable, the alternatives are not.
+
+        ``artifact_paths_for_media`` deliberately excludes the upload's own
+        ``FileField``; that one is deleted through the storage API below, and
+        double-deleting it would only produce a spurious warning.
+        """
         media = self.get_object()
 
         AnalysisResult = apps.get_model('analysis', 'AnalysisResult')
@@ -209,8 +244,14 @@ class MediaDetailView(generics.RetrieveDestroyAPIView):
                 status.HTTP_409_CONFLICT,
             )
 
+        # Imported here, not at module scope: this module is careful never to
+        # import analysis.* at load time (see _with_latest_analysis).
+        from analysis.services import artifact_paths_for_media
+        from common.storage import delete_paths
+
         media_id = media.media_id
         file_field = media.file
+        leftovers = artifact_paths_for_media(media)     # before the cascade
         media.delete()
 
         if file_field:
@@ -220,5 +261,11 @@ class MediaDetailView(generics.RetrieveDestroyAPIView):
             except Exception:  # pragma: no cover - best-effort cleanup
                 logger.warning('Could not remove file for deleted media %s', media_id)
 
-        logger.info('media deleted user=%s media_id=%s', request.user.pk, media_id)
+        reclaimed = delete_paths(leftovers)
+
+        logger.info(
+            'media deleted user=%s media_id=%s; reclaimed %d of %d artefact '
+            'path(s) on disk', request.user.pk, media_id, reclaimed,
+            len(leftovers),
+        )
         return Response(status=status.HTTP_204_NO_CONTENT)

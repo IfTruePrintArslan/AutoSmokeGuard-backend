@@ -10,26 +10,28 @@ Two shapes, matching the frozen contract's ``ReportObj``:
 * :class:`ReportDetailSerializer` — replaces that slim summary with the full
   nested ``AnalysisDetail`` for ``GET /api/report/{report_id}``.
 
-The full nested analysis (detail endpoint only) is sourced from
-``analysis.serializers
-.AnalysisDetailSerializer``, imported lazily inside the method rather than at
-module scope: the analysis app's serializers are being written concurrently
-by a sibling agent, and importing them at import time would make this whole
-app fail to load until that lands. If the import (or the serializer itself)
-raises, a minimal inline dict built straight from the ORM is used instead, so
-this endpoint — and the tests in ``tests/test_reports.py`` — work regardless
-of the other app's state.
-"""
-import logging
+The full nested analysis (detail endpoint only) is
+``analysis.serializers.AnalysisDetailSerializer`` — the real one, imported at
+module scope, with nothing behind it.
 
+That used to be a lazy import wrapped in ``except Exception:``, falling back
+to a minimal inline dict, because the analysis app's serializers were being
+written concurrently and might not have existed yet.  They exist.  Keeping
+the guard had become actively harmful (review finding F10): the ``except``
+caught *serialization* failures too, so one malformed ``bounding_box`` turned
+``GET /api/report/{id}`` into a permanent 200 carrying a quietly different
+shape — ``annotated_frames: []``, ``segmenter_mode: null``, ``device: null``
+where the real serializer emits ``""`` — traced only by a single WARNING.
+A wrong answer that looks right is worse than an error, especially on the
+endpoint the report-review screen renders from, so a genuine serialization
+failure now surfaces as a real error with a traceback.
+"""
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from common.storage import media_url
+from analysis.serializers import AnalysisDetailSerializer
 
 from .models import GeneratedReport
-
-logger = logging.getLogger('asg.reports')
 
 
 class _ReportRowMediaSerializer(serializers.Serializer):
@@ -88,69 +90,6 @@ class ReportListSerializer(serializers.ModelSerializer):
         return f'/api/download-report/{obj.report_id}'
 
 
-def _fallback_analysis_detail(analysis):
-    """
-    Minimal, dependency-free stand-in for ``analysis.serializers
-    .AnalysisDetailSerializer``.
-
-    # TODO(reports): remove this fallback once the analysis app's own
-    # serializer is guaranteed to be importable; this only covers the fields
-    # reports/tests.py and the frozen AnalysisDetail contract need.
-    """
-    media = analysis.media
-    vehicles = []
-    for vehicle in analysis.vehicles.prefetch_related('smoke_regions').all():
-        smoke = vehicle.smoke_regions.first()
-        vehicles.append({
-            'vehicle_id': str(vehicle.vehicle_id),
-            'vehicle_type': vehicle.vehicle_type,
-            'bounding_box': vehicle.bounding_box,
-            'confidence': vehicle.confidence,
-            'frame_number': vehicle.frame_number,
-            'timestamp_seconds': vehicle.timestamp_seconds,
-            'crop_path': media_url(vehicle.crop_path) if vehicle.crop_path else None,
-            'smoke': None if smoke is None else {
-                'smoke_id': str(smoke.smoke_id),
-                'mask_path': media_url(smoke.mask_path) if smoke.mask_path else None,
-                'intensity': smoke.intensity,
-                'severity': smoke.severity,
-                'confidence': smoke.confidence,
-                'area_ratio': smoke.area_ratio,
-                'opacity': smoke.opacity,
-            },
-        })
-
-    return {
-        'analysis_id': str(analysis.analysis_id),
-        'media': {
-            'media_id': str(media.media_id),
-            'filename': media.filename,
-            'media_type': media.media_type,
-            'url': media_url(media.file_path) if media.file_path else None,
-        },
-        'status': analysis.status,
-        'progress': analysis.progress,
-        'created_at': analysis.created_at,
-        'start_time': analysis.start_time,
-        'end_time': analysis.end_time,
-        'duration_seconds': analysis.duration_seconds,
-        'total_vehicles': analysis.total_vehicles,
-        'total_smoke': analysis.total_smoke,
-        'avg_confidence': analysis.avg_confidence,
-        'overall_severity': analysis.overall_severity or None,
-        'severity_counts': analysis.severity_counts,
-        'preview_url': media_url(analysis.preview_path) if analysis.preview_path else None,
-        'report': None,
-        'settings_snapshot': analysis.settings_snapshot,
-        'frames_processed': analysis.frames_processed,
-        'error_message': analysis.error_message,
-        'annotated_frames': [],
-        'vehicles': vehicles,
-        'segmenter_mode': None,
-        'device': None,
-    }
-
-
 class ReportDetailSerializer(ReportListSerializer):
     """
     Full ``ReportObj`` shape: the slim ``analysis`` summary from
@@ -163,17 +102,12 @@ class ReportDetailSerializer(ReportListSerializer):
 
     @extend_schema_field(serializers.DictField())
     def get_analysis(self, obj):
-        try:
-            from analysis.serializers import AnalysisDetailSerializer
-        except ImportError:
-            return _fallback_analysis_detail(obj.analysis)
+        """
+        The full ``AnalysisDetail``, from the analysis app's own serializer.
 
-        try:
-            return AnalysisDetailSerializer(obj.analysis, context=self.context).data
-        except Exception:
-            logger.warning(
-                'analysis.serializers.AnalysisDetailSerializer failed for '
-                'analysis %s; falling back to the inline shape.',
-                obj.analysis_id, exc_info=True,
-            )
-            return _fallback_analysis_detail(obj.analysis)
+        No ``try``/``except``.  Anything this raises is a real defect in the
+        data or in that serializer, and the caller is entitled to hear about
+        it — see the module docstring and review finding F10 for why the
+        fallback that used to sit here was removed rather than tightened.
+        """
+        return AnalysisDetailSerializer(obj.analysis, context=self.context).data

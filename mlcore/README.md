@@ -368,3 +368,19 @@ After retraining, re-run `mlcore.selftest` and re-check the
 `largest_blob_ratio` floor in `pipeline.py` against the new checkpoint's
 behaviour on `sample_bus_smoking.jpg` specifically — see "The
 `largest_blob_ratio` gate" above.
+
+## Model rollback
+
+The current checkpoint on disk (`ml_assets/smoke_unet.pt`) has SHA256:
+
+```
+1d2b1de19102d8d66584bf7440839cfb04d7a8ffb449d5f1fdfce9c0692a354f
+```
+
+It can be replaced with the previous checkpoint (SHA256 `3cda307e550d3b9ea591f75194f31ca5eb7401d11b1df28540dcc9484266194a`, saved at git commit f7ed668) without any code changes, using:
+
+```bash
+git show f7ed668:ml_assets/smoke_unet.pt > ml_assets/smoke_unet.prev.pt
+```
+
+**Alternative: evaluate with a custom checkpoint without moving files.** `mlcore.config.MLConfig.segmenter_weights` accepts an absolute path override; pass it when instantiating the config to test a checkpoint from anywhere on disk, then save it to `ml_assets/smoke_unet.pt` only when validated.

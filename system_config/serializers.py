@@ -30,6 +30,11 @@ from django.conf import settings
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
+from common.validators import (
+    SUPPORTED_IMAGE_EXTENSIONS,
+    SUPPORTED_VIDEO_EXTENSIONS,
+)
+
 from .models import SystemSetting
 
 logger = logging.getLogger('asg.sysconfig')
@@ -42,13 +47,22 @@ logger = logging.getLogger('asg.sysconfig')
 #: whitespace and anything else that is not a bare extension token.
 FORMAT_TOKEN_RE = re.compile(r'^[a-z0-9]{2,5}$')
 
-#: What ``mlcore``/Pillow/OpenCV can actually decode on this deployment.
-#: Deliberately narrower than "anything a browser will render" — see
-#: ``mlcore.config.IMAGE_SUFFIXES`` / ``VIDEO_SUFFIXES`` for the pipeline's
-#: own list, which this mirrors for the still-image and video containers we
-#: support end to end.
-SUPPORTED_IMAGE_FORMATS = ('jpg', 'jpeg', 'png', 'bmp', 'webp')
-SUPPORTED_VIDEO_FORMATS = ('mp4', 'avi', 'mov', 'mkv', 'webm')
+#: What this deployment can actually decode — re-exported from the uploader's
+#: own policy table rather than restated here.
+#:
+#: These two names used to be hand-written literals and they had drifted from
+#: ``common.validators._EXTENSION_POLICY``: the settings API accepted
+#: ``bmp``/``webp``/``mkv``/``webm`` (the Settings chip editor even
+#: placeholders "Add format (e.g. webp)") and every subsequent upload of one
+#: was rejected — by a message that listed the rejected format among the
+#: accepted ones.  Deriving them makes "an admin can only enable something
+#: the uploader will accept" true by construction (review finding F8).
+#:
+#: To add a container: teach ``common.validators`` its signature, prove
+#: Pillow/OpenCV genuinely decode it, add the ``_EXTENSION_POLICY`` entry —
+#: and it appears here on its own.
+SUPPORTED_IMAGE_FORMATS = SUPPORTED_IMAGE_EXTENSIONS
+SUPPORTED_VIDEO_FORMATS = SUPPORTED_VIDEO_EXTENSIONS
 
 
 def _normalise_tokens(raw_items):

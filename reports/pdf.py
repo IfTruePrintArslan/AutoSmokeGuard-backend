@@ -26,7 +26,9 @@ the disclaimer): the product's real webfont ships as ``.woff2``, which
 to carry the brand instead of a matching typeface.
 """
 import logging
+import os
 import re
+import tempfile
 from io import BytesIO
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
@@ -54,6 +56,14 @@ from reportlab.platypus import (
 from common.storage import analysis_artifact_dir, from_media_relative
 
 logger = logging.getLogger('asg.reports')
+
+#: Filesystem mode the finished PDF is published with. Mirrors Django's
+#: ``FILE_UPLOAD_PERMISSIONS`` (default ``0o644``) so a report sits under
+#: ``MEDIA_ROOT`` with the same permissions as every uploaded file — see the
+#: chmod in :func:`build_report` for why this has to be stated explicitly.
+_PUBLISHED_FILE_MODE = (
+    getattr(django_settings, 'FILE_UPLOAD_PERMISSIONS', None) or 0o644
+)
 
 # ---------------------------------------------------------------------------
 # Visual language — mirrors the product UI palette exactly.
@@ -788,6 +798,24 @@ def build_report(analysis, report_id, output_path):
     off a ``GeneratedReport`` row) because :mod:`reports.services` calls this
     before the row exists for a first-time generation — the id it hands in is
     the one the row will be saved under.
+
+    The write is **atomic** (review finding F11).  ``output_path`` is a
+    stable, publicly reachable location: ``GET /api/download-report/{id}``
+    streams it, and a forced regeneration reuses the same ``report_id`` and
+    therefore the same path on purpose, so a shared link keeps working.
+    Handing that path straight to reportlab meant a second renderer — a
+    double-clicked Download button against a row whose file had gone
+    missing, two gunicorn threads, a cron re-render — truncated the file
+    another request was already streaming, and made ``stat().st_size``
+    report a half-written length.
+
+    So the story is rendered into a uniquely named temporary file *in the
+    same directory* and moved onto ``output_path`` with :func:`os.replace`,
+    which is atomic on POSIX and, since Python 3.3, on Windows too.  Same
+    directory matters: it guarantees the same filesystem, which is what
+    makes the move a rename instead of a copy.  A reader that already has
+    the old file open keeps reading it to the end; a reader that opens after
+    the move gets a complete new file.  Nobody ever observes a partial one.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -809,14 +837,48 @@ def build_report(analysis, report_id, output_path):
     story.extend(_methodology_section(analysis))
     story.extend(_disclaimer_section())
 
-    doc = SimpleDocTemplate(
-        str(output_path),
-        pagesize=PAGE_SIZE,
-        leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=MARGIN, bottomMargin=MARGIN,
-        title='Smoke Analysis Report — AutoSmokeGuard',
-        author='AutoSmokeGuard',
+    # mkstemp (not a bare uuid name) so the reservation is made by the
+    # kernel with O_EXCL: two renderers can never pick the same scratch
+    # name. The descriptor is closed immediately — reportlab wants a path,
+    # and on Windows a second open of a still-held handle fails.
+    handle, temporary = tempfile.mkstemp(
+        dir=str(output_path.parent),
+        prefix=f'.{output_path.stem}.',
+        suffix='.partial.pdf',
     )
-    doc.build(story, canvasmaker=_NumberedCanvas)
+    os.close(handle)
 
-    return count_pdf_pages(output_path)
+    try:
+        doc = SimpleDocTemplate(
+            temporary,
+            pagesize=PAGE_SIZE,
+            leftMargin=MARGIN, rightMargin=MARGIN,
+            topMargin=MARGIN, bottomMargin=MARGIN,
+            title='Smoke Analysis Report — AutoSmokeGuard',
+            author='AutoSmokeGuard',
+        )
+        doc.build(story, canvasmaker=_NumberedCanvas)
+
+        # Counted off the temporary file: after the replace the name may
+        # already belong to a *different* renderer's output.
+        page_count = count_pdf_pages(temporary)
+
+        # mkstemp creates 0600, but a rename carries the mode with it, so
+        # the published PDF would end up unreadable by anyone but the app
+        # user — and in the shipped deployment nginx serves MEDIA_ROOT
+        # directly. Restore the mode every other file under MEDIA_ROOT gets,
+        # which is what reportlab writing through the umask used to give us.
+        os.chmod(temporary, _PUBLISHED_FILE_MODE)
+
+        os.replace(temporary, output_path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            # The render blew up part-way; do not leave a .partial.pdf behind.
+            try:
+                os.unlink(temporary)
+            except OSError:                       # pragma: no cover - best effort
+                logger.warning('Could not remove the partial render at %s',
+                               temporary, exc_info=True)
+
+    return page_count

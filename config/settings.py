@@ -136,6 +136,16 @@ MIDDLEWARE = [
     # route config.urls adds under DEBUG. See common.middleware for the
     # scope of what it does and does not protect (finding ASG-04).
     'common.middleware.MediaGuardMiddleware',
+    # Rewrites an HTML 404 under /api/ into the {detail, code, errors}
+    # envelope (robustness finding §B: a malformed <uuid:...> path parameter
+    # 404s at the URL resolver, so DRF's exception handler never runs — and
+    # under DEBUG Django's technical 404 page lists every registered URL
+    # pattern to an unauthenticated caller). Placed here, near the top, so
+    # its *response* phase runs last: CommonMiddleware has already had its
+    # APPEND_SLASH say and CorsMiddleware has already attached its headers.
+    # See common.middleware for the full rationale and for the responses it
+    # deliberately leaves alone.
+    'common.middleware.ApiErrorEnvelopeMiddleware',
     # WhiteNoise serves collected static files (admin CSS, Swagger UI assets)
     # straight from the WSGI app; it must sit directly after SecurityMiddleware.
     'whitenoise.middleware.WhiteNoiseMiddleware',

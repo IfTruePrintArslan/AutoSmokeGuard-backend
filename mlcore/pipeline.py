@@ -45,32 +45,113 @@ class MLPipelineError(RuntimeError):
 # --------------------------------------------------------------------------- #
 # Detection floors
 #
-# A segmenter always returns *some* probability mass, so three floors decide
-# whether a response is reported as an emission.  All three must be cleared.
+# A segmenter always returns *some* probability mass, so these floors decide
+# whether a response is reported as an emission.  All of them must be cleared.
 #
 #   MIN_SMOKE_AREA_RATIO   Total thresholded plume area, as a fraction of the
 #       exhaust ROI.  Filters out the handful of stray pixels every model
 #       produces on a hard crop.
 #
 #   MIN_SMOKE_BLOB_RATIO   Area of the *largest connected component*, same
-#       units.  This is the one that actually does the work.  Measured over
-#       the bundled sample media, false activations on clean vehicles are
-#       scattered speckle along the bumper line -- individually tiny, but they
-#       can sum to more total area than a genuine plume occupies in the very
-#       large ROI of a bus.  Real smoke is one coherent mass.  The measured
-#       split on the sample media is:
-#           clean vehicles  : largest blob <= 0.0169 of the ROI (49 ROIs)
-#           smoking vehicles: largest blob  = 0.0207 (bus) .. 0.153 (truck)
-#       so the floor sits at 0.018, between the two. The margin on the bus
-#       side is modest; it is a calibration point, not a law of nature, and
-#       should be re-measured if the segmenter is retrained.
+#       units.  Real smoke is one coherent mass; segmentation speckle is many
+#       tiny ones, and total area alone cannot tell them apart.
+#
+#       This gate does much less than it was once credited with.  The comment
+#       here used to claim it "is the one that actually does the work".  That
+#       was measured and it is false.
+#
+#       Against the model it was calibrated for, removing the blob gate
+#       entirely cost **3 additional false positives in 126 real clean
+#       vehicle ROIs** (docs/REAL_DATA_EVALUATION.md §5.2).  Against the
+#       retrained segmenter it costs **0 in 229** -- 0 of 70 human-annotated
+#       boxes and 0 of 159 densely-sampled real surveillance ROIs.  The gate
+#       is now completely inert on real data.
+#
+#       The reason is that MIN_SMOKE_AREA_RATIO is co-binding almost
+#       everywhere: a shadow large enough to form a coherent blob is also
+#       large enough to clear the area gate.  It is kept because it costs
+#       nothing and still guards the scattered-speckle case on synthetic
+#       media, but nothing should be built on the assumption that it filters
+#       real false positives, because it does not.
+#
+#       What took over from it is *not* MIN_SMOKE_BLOB_PIXELS.  An earlier
+#       revision of this comment said "the work is done by
+#       MIN_SMOKE_BLOB_PIXELS below, which removes 9 false positives in the
+#       same 229 ROIs".  The arithmetic holds; the reading does not.  All
+#       nine of those are on the 70 human-annotated COCO boxes and **zero**
+#       are on the 159 in-domain surveillance ROIs.  In domain, no gate in
+#       this block carries the false-positive improvement -- the retrained
+#       checkpoint does, 95.9% of it by Shapley attribution over both
+#       orderings (docs/REAL_DATA_EVALUATION.md R4.2).  These constants are
+#       worth keeping, but not for that.
+#
+#   MIN_SMOKE_BLOB_PIXELS  Absolute size of that component, in pixels.
+#       The two gates above are *ratios*, and ratios have no floor: the
+#       evaluation found a 16x7 = 112-pixel ROI in which 15 mask pixels came
+#       to 13.4% area and an 11.6% largest blob, cleared every gate, and was
+#       reported as a moderate-severity emission (§2.4).  Six of the fourteen
+#       measured false positives came from ROIs of 12x4 to 38x8 pixels.
+#
+#       64 px is an 8x8 patch.  Below that the measurement is not merely
+#       noisy, it is undefined: extract_features() runs a 3x3 Canny and fits a
+#       contour perimeter for compactness, and neither means anything on a
+#       region a handful of pixels across.  It is also the point below which a
+#       blob cannot survive the round trip through the network's 256x256
+#       output grid as more than interpolation ringing.  The classical
+#       fallback has refused to run below 12 px on either side since it was
+#       written; this gives the U-Net path the equivalent floor it never had.
+#
+#       Note this is *latent* on the product path: YOLO does not detect
+#       vehicles small enough to produce such ROIs at conf=0.35, so the floor
+#       removes 0 of the 2 product-path false positives.  It bites the moment
+#       the confidence threshold drops, the detector is upgraded, or
+#       higher-resolution input arrives.  Where it can act it acts hard, and
+#       that place is *out of domain*: over the 70 human-annotated COCO
+#       vehicle boxes it takes the retrained model from 11 false positives to
+#       2, and the previous model from 6 to 0.  In domain it does nothing at
+#       all -- over 160 densely-sampled real surveillance ROIs it removes
+#       **zero** false positives, and that holds for *both* checkpoints.  So:
+#       the most effective gate in this block out of domain, inert in domain,
+#       and kept on measurement-validity grounds rather than because it was
+#       fitted to a result.
+#
+#   MIN_MEASURABLE_ROI_SIDE  An ROI thinner than this in either direction
+#       cannot support a measurement at all, so the pipeline declines to make
+#       one rather than upsampling a 256x256 probability map onto a 12x4 crop
+#       and reporting whatever comes back.  Same 12 px the classical path
+#       already uses, for the same reason.
+#
+#       Measured in-domain contribution: **exactly one** false positive of
+#       28, for either checkpoint.  That is the whole of it.
+#
+#       Declining is not the same as dropping.  The vehicle stays on the
+#       record with smoke_not_measured set (see _FrameAnalyzer.process), so it
+#       remains in the denominator of any rate that claims to describe the
+#       product.  A harness that drops it instead reports 3.77% on the dense
+#       surveillance probe where the product's own denominator gives 3.75%;
+#       both numbers appear in docs/REAL_DATA_EVALUATION.md and the
+#       difference is that convention, not a disagreement about the pixels.
 #
 #   MIN_SMOKE_DENSITY      Combined density score, i.e. roughly "half of the
 #       low severity band".  Rejects a plume that is large but utterly
-#       transparent, textureless and pale.
+#       transparent, textureless and pale.  Nearly inert on real footage --
+#       it passed 22 of 33 surveillance vehicles (§5.2).
+#
+# MIN_SMOKE_BLOB_RATIO was deliberately left at 0.018 when the segmenter was
+# retrained, rather than recalibrated.  See the Remediation section of
+# docs/REAL_DATA_EVALUATION.md: no value of it separates real clean vehicles
+# from real smoking ones under the new model either.  A clean surveillance
+# ROI scores 0.0227 while the genuine plume in sample_bus_smoking.jpg scores
+# 0.0220 -- the orderings interleave, so any threshold that clears the
+# shadow also discards the plume.  Moving the number would have dressed that
+# up rather than fixed it.  What did change is the shape of the clean
+# distribution: on 159 real surveillance ROIs the share scoring exactly zero
+# went from 33.8% to 83.0% and p90 fell from 0.0382 to 0.0017.
 # --------------------------------------------------------------------------- #
 MIN_SMOKE_AREA_RATIO = 0.02
 MIN_SMOKE_BLOB_RATIO = 0.018
+MIN_SMOKE_BLOB_PIXELS = 64
+MIN_MEASURABLE_ROI_SIDE = 12
 MIN_SMOKE_DENSITY = 0.15
 
 #: Annotated frames written to ``frames/``.
@@ -157,12 +238,20 @@ class _FrameAnalyzer:
                     vehicles.append(record)
                     continue
 
+                # Too thin to measure: decline rather than upsample a 256x256
+                # probability map onto a 12x4 crop and believe the result.
+                if min(roi.shape[:2]) < MIN_MEASURABLE_ROI_SIDE:
+                    record["smoke_not_measured"] = "roi_below_minimum_size"
+                    vehicles.append(record)
+                    continue
+
                 features = extract_features(mask, roi, binarise_at=self.config.mask_threshold)
                 density = smoke_density(features)
 
                 if (
                     features["area_ratio"] >= MIN_SMOKE_AREA_RATIO
                     and features["largest_blob_ratio"] >= MIN_SMOKE_BLOB_RATIO
+                    and features["largest_blob_pixels"] >= MIN_SMOKE_BLOB_PIXELS
                     and density >= MIN_SMOKE_DENSITY
                 ):
                     severity = classify_severity(

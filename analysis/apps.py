@@ -8,6 +8,14 @@ in-process job worker gets its two boot-time chores:
    ``running`` or ``queued`` by a crashed process have nothing behind them and
    would otherwise show a progress bar that never moves.
 
+   The sweep resolves only the rows it can *prove* are abandoned: it is
+   scoped by the ``(host, pid, boot)`` stamp every non-terminal row carries.
+   That scoping is not optional — the shipped production default is
+   ``gunicorn --workers 2`` (``docker/entrypoint.sh``), so ``ready()`` runs
+   once per worker process, and a worker the arbiter has just replaced must
+   never resolve its sibling's live analysis.  See
+   :func:`analysis.worker.recover_interrupted_jobs`.
+
 2. **Warm-up.**  Loading YOLO and the U-Net takes several seconds.  Doing it
    on a daemon thread at boot means the first user to press Analyse waits for
    inference, not for imports.
@@ -16,7 +24,10 @@ Both run on a background thread and both are heavily guarded — ``ready()``
 also fires for ``manage.py migrate`` (against a database that may have no
 tables yet), for ``manage.py check`` and under pytest, and in none of those
 cases should the process load torch or touch job rows.  See
-:func:`analysis.worker.should_bootstrap`.
+:func:`analysis.worker.should_bootstrap` for which invocations count as
+serving (including ``runserver --noreload``, gunicorn and uWSGI), and
+:func:`analysis.worker.start_bootstrap` for the per-process idempotency
+guard that stops a second ``ready()`` from starting a second boot thread.
 """
 import logging
 
