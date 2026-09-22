@@ -1,20 +1,65 @@
-# python
+# --- python ----------------------------------------------------------------
 __pycache__/
 *.py[cod]
+*.pyc
 *.egg-info/
-# venv
+
+# --- virtual environments --------------------------------------------------
 venv/
 .venv/
 env/
-# django
+
+# --- django ----------------------------------------------------------------
 db.sqlite3
+db.sqlite3-journal
+# WAL sidecars — the SQLite branch of settings.py runs in journal_mode=WAL,
+# which keeps a '-wal' log and a '-shm' index next to the database file.
+db.sqlite3-wal
+db.sqlite3-shm
+# Local test databases (settings.DATABASES['default']['TEST']['NAME'] normally
+# lives in the OS temp dir, but ASG_TEST_DB_NAME can point it here).
+test_db*.sqlite3
+test_db*.sqlite3-wal
+test_db*.sqlite3-shm
 /staticfiles/
 /media/
-# env
+/logs/
+
+# --- environment -----------------------------------------------------------
 .env
 .env.*
 !.env.example
-# os / editor
+
+# --- TLS key material ------------------------------------------------------
+# scripts/generate-dev-certs.sh writes a self-signed certificate and key for
+# local HTTPS testing (DEPLOYMENT.md §7). Its default output directory is
+# <project root>/certs, which sits *outside* this repository — backend/ and
+# frontend/ are separate git worktrees and the project root is not itself a
+# repo, so nothing there is tracked in the first place. These patterns cover
+# the case where CERT_DIR is pointed inside this tree, and the case where the
+# two trees are ever merged into one repository.
+certs/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# --- tests / coverage ------------------------------------------------------
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# --- ml assets -------------------------------------------------------------
+# Model weights (*.pt) ARE tracked — the app cannot start without them.
+# Training data and training run outputs are not.
+ml_assets/datasets/
+ml_assets/runs/
+
+# --- os / editor -----------------------------------------------------------
 .DS_Store
 .vscode/
+.idea/
 *.log

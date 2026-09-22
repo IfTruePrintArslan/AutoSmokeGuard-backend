@@ -1,0 +1,111 @@
+name: Backend CI
+
+# backend/ is its own git repository, so this workflow's checkout root IS the
+# repo root (manage.py, requirements.txt, Dockerfile all live at ".").
+on:
+  push:
+    branches: [main, dev, staging]
+  pull_request:
+    branches: [main, dev, staging]
+
+env:
+  # Never start the in-process analysis worker in CI: tests exercise the
+  # worker logic directly/synchronously, and a live background thread would
+  # just be a source of flaky, racy test runs.
+  ASG_WORKER_ENABLED: "False"
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install CPU-only torch/torchvision
+        # Installed from PyTorch's CPU wheel index *before* requirements.txt,
+        # exactly as backend/Dockerfile does. The default PyPI wheel pulls in
+        # the full CUDA runtime (~2GB of libcublas/libcudnn/...) that this
+        # project never uses (CPU-only inference) — on a GitHub-hosted
+        # runner that's not just slow, the runner's fixed-size disk can
+        # genuinely fill up and fail the job outright once torch, torchvision,
+        # ultralytics, and opencv are all in the mix.
+        run: |
+          pip install torch==2.14.0 torchvision==0.29.0 \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        # torch/torchvision are already satisfied by the previous step, so
+        # this only resolves the rest of requirements.txt.
+        run: pip install -r requirements.txt
+
+      - name: Django system checks
+        run: python manage.py check
+
+      - name: Check for missing migrations
+        # Fails the build if a model change was made without a matching
+        # migration file being committed alongside it.
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Run tests with coverage
+        run: pytest -q --cov
+
+      - name: Validate OpenAPI schema
+        # --fail-on-warn turns schema-generation warnings (e.g. an
+        # unresolvable serializer field) into a build failure instead of a
+        # silently degraded docs page.
+        run: python manage.py spectacular --fail-on-warn --file /tmp/schema.yml
+
+      - name: Compile check (ruff-free lint)
+        # This project does not use ruff; compileall is the cheap, dependency
+        # -free substitute that still catches syntax errors across the tree.
+        run: python -m compileall -q .
+
+  docker:
+    name: docker build + healthcheck
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build -t asg-backend:ci .
+
+      - name: Run container
+        # No DATABASE_URL set => settings.py falls back to SQLite, so this
+        # needs no Postgres service container to boot and reach a healthy
+        # state.
+        run: docker run -d --name asg-backend-ci -p 8000:8000 asg-backend:ci
+
+      - name: Wait for container healthcheck to pass
+        run: |
+          for i in $(seq 1 30); do
+            status="$(docker inspect --format='{{.State.Health.Status}}' asg-backend-ci)"
+            echo "attempt $i: health status = $status"
+            if [ "$status" = "healthy" ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Container never became healthy" >&2
+          docker logs asg-backend-ci
+          exit 1
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs asg-backend-ci || true
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f asg-backend-ci || true
