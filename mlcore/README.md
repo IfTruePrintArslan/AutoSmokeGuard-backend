@@ -20,8 +20,9 @@ exactly one function, `mlcore.analyze_media`, from `analysis/worker.py`.
 | `model.py` | `SmokeUNet` — the segmentation network architecture |
 | `segmenter.py` | `SmokeSegmenter` — loads `SmokeUNet` checkpoints, runs batched inference, and falls back to a classical CV heuristic when no checkpoint is present |
 | `intensity.py` | Turns a probability mask into `area_ratio` / `mean_opacity` / `edge_density` / `darkness` / `compactness` / `largest_blob_ratio` features, combines them into a single `smoke_density` score, classifies severity, and aggregates per-region results into a media-level verdict |
+| `tracking.py` | `VehicleTracker` — greedy IoU association of detections into per-vehicle tracks across sampled frames, plus `track_is_persistent`, the rule that decides whether a vehicle's smoke responses persisted long enough to count (see "Why one firing ROI is not an emission" below) |
 | `annotate.py` | Draws vehicle boxes, smoke overlays and severity chips onto frames for the PDF/UI artifacts |
-| `pipeline.py` | `analyze_media` — the single entry point; orchestrates detection → segmentation → density gating → artifact writing → progress reporting for one image or video |
+| `pipeline.py` | `analyze_media` — the single entry point; orchestrates detection → segmentation → density gating → **persistence confirmation** → artifact writing → progress reporting for one image or video |
 | `selftest.py` | `python -m mlcore.selftest` — runs the real pipeline against `backend/sample_media/`, asserts the NFR budgets and the clean/smoking expectations per file |
 | `training/synth_dataset.py` | Procedural dataset generator |
 | `training/train_unet.py` | Training loop, loss, dataset class, augmentation |
@@ -271,6 +272,53 @@ bundled sample files (on `mps`) passes all checks with this gate in place:
 and `sample_street_clean.jpg` report 0, and `sample_truck_smoking.mp4` reports
 26 smoke judgements across its sampled frames — all within the NFR budgets
 (see "Performance" below).
+
+## Why one firing ROI is not an emission
+
+The five floors above decide whether **one** exhaust ROI in **one** frame looks
+like smoke. Combining those decisions into a verdict is a separate problem, and
+for most of this project's life it was solved with `any(...)`: a single firing
+ROI anywhere in a clip made the whole clip "smoking".
+
+That cannot work at this scale. A single clean-traffic clip in the evaluation
+corpus yields **359 vehicle ROIs**, and the shipped checkpoint's per-ROI false
+alarm rate on clean vehicles is 12.8% at matched scale (35.3% on distant
+traffic). Even a hypothetical 1% per-ROI error gives `1 - 0.99**359 = 97%`
+clip-level false alarms. Measured: **12 of 12** clean-traffic clips were
+reported smoking, one at `high` severity on clear daylight highway footage.
+Six retraining attempts had already failed to beat the shipped checkpoint on
+the product path; the aggregation, not the model, was the binding constraint.
+
+`tracking.py` replaces it. Detections are associated into per-vehicle tracks
+(greedy IoU, one missed frame of tolerance), and a vehicle counts as emitting
+only when its smoke **persisted**: `MIN_SMOKE_TRACK_HITS` firing observations,
+`MIN_SMOKE_TRACK_RUN` of them consecutive, over at least
+`MIN_SMOKE_TRACK_FRACTION` of the frames that vehicle was visible for. The
+media is reported as smoking when at least one vehicle clears that bar; when
+none does, the run's responses are discarded and it reports no smoke, with its
+masks and preview overlays removed so the artifacts agree with the verdict.
+A still image has one frame and therefore no persistence evidence, so an image
+keeps the per-ROI decision unchanged.
+
+Measured on 65 real clips, shipped checkpoint unchanged, clip level:
+
+| | rear_tailpipe | vertical_stack | motorbike | negative | negative_closeup | negative_hard | per-vehicle FP |
+|---|---|---|---|---|---|---|---|
+| `any(...)` (was) | 14/15 | 6/6 | 0/1 | 12/12 | 14/28 | 2/3 | 51.9% |
+| persistence (now) | 11/15 | 4/6 | 0/1 | 11/12 | 6/28 | 0/3 | 9.0% |
+
+Read that honestly. Recall fell (20/22 to 15/22) and clean **close-up**
+vehicles improved a lot (14/28 to 6/28), as did the tyre-smoke clips (2/3 to
+0/3). Dense distant traffic barely moved, and that is arithmetic rather than
+tuning: those clips carry a median of 54 tracked vehicles each, so even at a
+5.6% per-vehicle false-positive rate the question "is *any* vehicle smoking"
+comes back yes with probability `1 - 0.944**54 = 96%`. No "exists a vehicle
+with property X" rule is clean on a 54-vehicle scene until the per-vehicle
+error is below roughly 0.1%. What did improve for those clips is the number
+that governs what an operator is shown: the per-vehicle false-positive rate,
+down 5.8x. The full derivation, the parameter sweep and one rejected
+alternative that looked much better and turned out to be a vehicle counter in
+disguise are in the `MIN_SMOKE_TRACK_*` comment block in `pipeline.py`.
 
 ## The classical fallback
 

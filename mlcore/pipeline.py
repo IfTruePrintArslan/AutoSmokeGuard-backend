@@ -26,6 +26,7 @@ from .detector import VehicleDetector
 from .intensity import aggregate, classify_severity, extract_features, severity_rank, smoke_density
 from .preprocess import MediaError, crop as crop_region, enhance, iter_frames, load_image, media_kind, probe_video
 from .segmenter import SmokeSegmenter
+from .tracking import VehicleTracker, persistent_tracks
 
 logger = logging.getLogger("asg.ml")
 
@@ -153,6 +154,105 @@ MIN_SMOKE_BLOB_RATIO = 0.018
 MIN_SMOKE_BLOB_PIXELS = 64
 MIN_MEASURABLE_ROI_SIDE = 12
 MIN_SMOKE_DENSITY = 0.15
+
+# --------------------------------------------------------------------------- #
+# Persistence confirmation
+#
+# Everything above decides whether ONE exhaust ROI in ONE frame looks like
+# smoke.  This block decides whether a clip's collection of such responses is
+# an *emission*.  The two questions are separate and were, until this block
+# existed, conflated: the media verdict was `any(smoke_regions)`, so a single
+# ROI anywhere in the clip condemned it.
+#
+# Why that had to change, in numbers
+# ----------------------------------
+# A clean-traffic clip in the evaluation corpus yields 359 vehicle ROIs.  The
+# shipped checkpoint's per-ROI false-alarm rate on clean vehicles is 12.8% at
+# matched scale and 35.3% on distant traffic.  Under `any(...)`, *every one*
+# of the 12 clean-traffic clips was reported smoking, one of them at HIGH
+# severity on clear daylight highway footage.  Even a hypothetical 1% per-ROI
+# error gives 1 - 0.99**359 = 97% clip-level false alarms.  No achievable
+# per-ROI accuracy rescues a 1-of-N rule at that N.
+#
+# The rule
+# --------
+# Detections are associated into per-vehicle tracks (mlcore.tracking), and a
+# track counts as emitting only when all three of the following hold.  The
+# media is reported as smoking when at least one track does.
+#
+#   MIN_SMOKE_TRACK_HITS      Firing observations on one vehicle.  Rejects
+#       the vehicle that fired once or twice while crossing a shadow.  At the
+#       default frame_sample_rate=5 on 15 fps footage, 4 hits is ~1.3 s.
+#
+#   MIN_SMOKE_TRACK_RUN       Of those, how many must be consecutive.  A
+#       plume is continuous; a reflection that fires on alternate frames is
+#       flicker.  Costs nothing at clip level and takes the per-vehicle false
+#       positive rate from 10.6% to 9.0%.
+#
+#   MIN_SMOKE_TRACK_FRACTION  Share of the vehicle's own observations that
+#       fired.  The only scale-free term, so it does not quietly weaken when
+#       an admin changes frame_sample_rate.  It is also what separates tyre
+#       smoke from exhaust: the burnout clip fires on 7 of the 35 frames its
+#       car is visible for (20%), below the bar, while a smoking exhaust
+#       fires on most of them.  Dropping this term alone puts that clip back
+#       into the false positives (negative_hard 0/3 -> 1/3).
+#
+# Measured, shipped checkpoint unchanged, 65-clip real corpus
+# (clip-level; positives / negatives by bucket):
+#
+#     rule                     rear    stack   moto | neg    negCU   negH   per-vehicle FP
+#     1-of-N (was)             14/15   6/6     0/1  | 12/12  14/28   2/3    51.9%
+#     hits>=2                  12/15   6/6     0/1  | 12/12  11/28   1/3    27.9%
+#     hits>=3 run>=2 frac>=.3  11/15   4/6     0/1  | 11/12   8/28   0/3    13.6%
+#     hits>=4 run>=3 frac>=.3  11/15   4/6     0/1  | 11/12   6/28   0/3     9.0%   <- shipped
+#     hits>=6 run>=4 frac>=.5   7/15   2/6     0/1  | 10/12   4/28   0/3     4.6%
+#
+# So: clip-level recall 20/22 -> 15/22, clip-level false positives 28/43 ->
+# 17/43, and the per-vehicle false-positive rate -- the number that governs
+# what an operator is actually shown -- falls by 5.8x, from 51.9% to 9.0%.
+# The operating point is flat: moving any one of the three parameters by one
+# step leaves the clip-level numbers unchanged (see the sweep above), which is
+# the evidence that it is not fitted to a knife edge.
+#
+# What this does NOT fix, stated plainly
+# --------------------------------------
+# Distant multi-vehicle traffic: 11 of 12 such clips are still reported
+# smoking.  That is not a tuning failure, it is arithmetic.  Those clips carry
+# a median of 54 tracked vehicles each, so even at a 5.6% per-vehicle false
+# positive rate an "is any vehicle smoking?" question comes back yes with
+# probability 1 - 0.944**54 = 96%.  No rule of the form "exists a vehicle
+# with property X" can be clean on a 54-vehicle scene until the per-vehicle
+# error is driven below ~0.1%, and that is a model problem, not an
+# aggregation one.  The honest fix for busy scenes is to stop asking a
+# clip-level question and report per vehicle; see the note in
+# API_CONTRACT.md.
+#
+# A rejected alternative, recorded so it is not re-proposed
+# --------------------------------------------------------
+# Requiring the candidate vehicle to be an *outlier among its neighbours* in
+# the same frame (mean density >= 2x the median of the other tracks) drops
+# clean-traffic false positives from 12/12 to 0/12 and looks like the answer.
+# It is not.  Ablated against the naive rule "reject any clip with 4 or more
+# tracked vehicles", the two score identically -- 14/22 recall, 4/43 false
+# positives, to the clip.  The contrast term contributes nothing; every
+# negative clip in the corpus has >= 9 vehicles and 18 of 22 positives have
+# <= 3, so the "outlier test" is a vehicle counter wearing a disguise.
+# Shipping it would have meant systematically under-reporting exactly the busy
+# roadside scenes this product exists for.
+#
+# Single-frame media
+# ------------------
+# A still image has one frame, therefore no persistence evidence, therefore
+# nothing for this block to test.  The verdict for an image falls back to the
+# per-ROI decision unchanged -- as strong as the detector and no stronger.
+# See the `single_frame` branch in analyze_media.
+# --------------------------------------------------------------------------- #
+#: Firing observations required on one tracked vehicle.
+MIN_SMOKE_TRACK_HITS = 4
+#: How many of those must be on consecutively observed frames.
+MIN_SMOKE_TRACK_RUN = 3
+#: Share of that vehicle's observations that must have fired.
+MIN_SMOKE_TRACK_FRACTION = 0.30
 
 #: Annotated frames written to ``frames/``.
 MAX_ANNOTATED_FRAMES = 12
@@ -358,12 +458,20 @@ def analyze_media(
     # -- main loop --------------------------------------------------------- #
     all_vehicles: list[dict[str, Any]] = []
     smoke_regions: list[dict[str, Any]] = []
-    # (interest_key, frame_index, timestamp, annotated_bgr)
-    best_frames: list[tuple[tuple[int, int, int, float], int, float, np.ndarray]] = []
+    # (interest_key, frame_index, timestamp, working_bgr, drawable_vehicles)
+    #
+    # The *un-annotated* frame is kept, not the annotated one.  Annotation now
+    # happens after the persistence verdict is known (below), because a clip
+    # whose responses turn out to be transient must not ship a preview with
+    # smoke overlays burnt into it contradicting its own "no smoke" summary.
+    # This costs no more memory than before -- draw() used to return a full
+    # copy of the same frame -- and the retained masks are downcast to uint8.
+    best_frames: list[tuple[tuple[int, int, int, float], int, float, np.ndarray, list[dict[str, Any]]]] = []
     frames_processed = 0
     detection_confidences: list[float] = []
     segmenting_announced = False
     budget = _ArtifactBudget()
+    tracker = VehicleTracker()
 
     for frame_index, timestamp, raw_frame in frames:
         try:
@@ -373,6 +481,10 @@ def analyze_media(
             continue
 
         frames_processed += 1
+        # Persistence evidence.  Fed before the per-vehicle bookkeeping below
+        # so the tracker sees exactly the detections the frame produced, in
+        # detector order, and never sees a frame twice.
+        tracker.update(frame_index, vehicles)
 
         for vehicle in vehicles:
             record: dict[str, Any] = {
@@ -407,23 +519,20 @@ def analyze_media(
             pct = 40 + int(32 * min(1.0, frames_processed / float(expected_frames)))
             _emit(progress_cb, pct, "segmenting")
 
-        # Only pay for annotation when the frame can still make the shortlist.
+        # Shortlist the frame for annotation.  Only what draw() reads is kept,
+        # so the bulky per-ROI feature dicts and float masks are still dropped
+        # at the end of the iteration.  The frame is copied rather than
+        # referenced: the shortlist now outlives the iteration, and a decoder
+        # that reuses its read buffer would otherwise rewrite frames that have
+        # already been chosen.  This is the same allocation draw() used to make
+        # here every time, minus the drawing, so it is strictly cheaper than
+        # what it replaces.
         interest = _frame_interest(vehicles)
         if vehicles and (len(best_frames) < MAX_ANNOTATED_FRAMES or interest > best_frames[-1][0]):
-            try:
-                annotated = draw(
-                    working,
-                    vehicles,
-                    frame_number=frame_index,
-                    timestamp=timestamp if kind == "video" else None,
-                    mask_threshold=cfg.mask_threshold,
-                )
-                best_frames.append((interest, int(frame_index), float(timestamp), annotated))
-                # Sort worst-severity-first; ties break toward the earlier frame.
-                best_frames.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-                del best_frames[MAX_ANNOTATED_FRAMES:]
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Annotation failed for frame %s: %s", frame_index, exc)
+            best_frames.append((interest, int(frame_index), float(timestamp), working.copy(), _drawable(vehicles)))
+            # Sort worst-severity-first; ties break toward the earlier frame.
+            best_frames.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+            del best_frames[MAX_ANNOTATED_FRAMES:]
 
         # The frame (and every mask taken from it) is no longer needed.
         del raw_frame, working, vehicles
@@ -433,35 +542,76 @@ def analyze_media(
 
     # -- aggregation ------------------------------------------------------- #
     _emit(progress_cb, 75, "aggregating")
+
+    # Persistence confirmation.  See the MIN_SMOKE_TRACK_* block above: the
+    # per-ROI responses collected in the loop are measurements, and this is
+    # the step that decides whether they add up to an emission.
+    #
+    # A single frame carries no persistence evidence at all, so there is
+    # nothing here to test and the per-ROI decision stands unchanged.  That is
+    # the documented behaviour for still images, and it also covers a video
+    # that yielded exactly one decodable frame.
+    single_frame = frames_processed <= 1
+    tracks = tracker.tracks
+    confirmed = persistent_tracks(
+        tracks, MIN_SMOKE_TRACK_HITS, MIN_SMOKE_TRACK_RUN, MIN_SMOKE_TRACK_FRACTION,
+    )
+    transient = bool(smoke_regions) and not single_frame and not confirmed
+    discarded_regions = 0
+    if transient:
+        discarded_regions = _discard_transient_smoke(all_vehicles, best_frames, out_root)
+        smoke_regions = []
+
     summary = aggregate(smoke_regions)
 
     # -- artifacts --------------------------------------------------------- #
     _emit(progress_cb, 90, "writing artifacts")
 
+    # Re-rank now that the verdict is in: on a clip whose responses were
+    # discarded every frame's severity key has collapsed, so the sort degrades
+    # to "most vehicles" and the preview shows the busiest frame rather than
+    # the one that happened to hold the loudest rejected response.
+    if transient:
+        best_frames.sort(key=lambda item: (_frame_interest(item[4]), -item[1]), reverse=True)
+
     annotated_paths: list[str] = []
     preview_path: str | None = None
-    for rank, (_interest, frame_index, _timestamp, annotated) in enumerate(best_frames):
+    for _interest, frame_index, frame_timestamp, frame_bgr, drawable in best_frames:
+        try:
+            annotated = draw(
+                frame_bgr,
+                drawable,
+                frame_number=frame_index,
+                timestamp=frame_timestamp if kind == "video" else None,
+                mask_threshold=cfg.mask_threshold,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed overlay must not lose the run
+            logger.warning("Annotation failed for frame %s: %s", frame_index, exc)
+            continue
         target = out_root / "frames" / f"frame_{frame_index:06d}.jpg"
         try:
             save_frame(annotated, target)
         except OSError as exc:
             logger.warning("Could not write annotated frame %s: %s", target, exc)
+            del annotated
             continue
         rel = _relative(target, out_root)
         annotated_paths.append(rel)
-        if rank == 0:
+        # `best_frames` is sorted worst-severity-first, so the first frame
+        # written is the highest-severity one; with no smoke anywhere the sort
+        # key degrades to "most vehicles", the required fallback.  Keyed on
+        # "nothing written yet" rather than on rank so that a frame that fails
+        # to encode hands the preview to the next best one instead of leaving
+        # a run with detections and no preview at all.
+        if preview_path is None:
             preview_path = rel
-
-    # `best_frames` is already sorted worst-severity-first, so the first saved
-    # frame is the highest-severity one; with no smoke anywhere the sort key
-    # degrades to "most vehicles", which is exactly the required fallback.
-    if preview_path and annotated_paths:
-        try:
-            preview_target = out_root / "preview.jpg"
-            save_frame(best_frames[0][3], preview_target)
-            preview_path = _relative(preview_target, out_root)
-        except OSError as exc:
-            logger.warning("Could not write preview: %s", exc)
+            try:
+                preview_target = out_root / "preview.jpg"
+                save_frame(annotated, preview_target)
+                preview_path = _relative(preview_target, out_root)
+            except OSError as exc:
+                logger.warning("Could not write preview: %s", exc)
+        del annotated
 
     elapsed = time.time() - started
     result: dict[str, Any] = {
@@ -479,14 +629,115 @@ def analyze_media(
         "device": device_string(cfg.torch_device()),
         "elapsed_seconds": round(elapsed, 3),
         "media_meta": media_meta,
+        # Diagnostic only.  The web layer does not persist this key (see
+        # analysis.worker._persist, which names the fields it stores), so it
+        # adds nothing to the API contract; it exists so an operator reading a
+        # result dict, the selftest or an evaluation harness can see *why* a
+        # clip was or was not confirmed without re-running the pipeline.
+        "smoke_persistence": {
+            "rule": {
+                "min_hits": MIN_SMOKE_TRACK_HITS,
+                "min_run": MIN_SMOKE_TRACK_RUN,
+                "min_fraction": MIN_SMOKE_TRACK_FRACTION,
+            },
+            "applied": not single_frame,
+            "tracked_vehicles": len(tracks),
+            "confirmed_vehicles": len(confirmed),
+            "discarded_regions": discarded_regions,
+            "confirmed": [track.as_dict() for track in confirmed],
+        },
     }
     _emit(progress_cb, 100, "done")
     logger.info(
-        "Analysed %s: %d frame(s), %d vehicle(s), %d smoke region(s), severity=%s in %.2fs (%s).",
+        "Analysed %s: %d frame(s), %d vehicle(s), %d smoke region(s), severity=%s in %.2fs (%s); "
+        "persistence: %d/%d tracked vehicle(s) confirmed%s.",
         source.name, frames_processed, result["total_vehicles"], result["total_smoke"],
         result["overall_severity"], elapsed, result["segmenter_mode"],
+        len(confirmed), len(tracks),
+        f", {discarded_regions} transient region(s) discarded" if discarded_regions else
+        (" (single frame: rule not applicable)" if single_frame else ""),
     )
     return result
+
+
+def _drawable(vehicles: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The subset of a frame's detections that :func:`mlcore.annotate.draw` reads.
+
+    Annotation is deferred until the persistence verdict is known, so a frame
+    on the shortlist has to be carried past the end of its iteration.  Carrying
+    the analyzer's own records would pin the full feature dicts and the
+    float32 probability maps; this keeps the four fields ``draw`` touches and
+    downcasts the mask to ``uint8`` (which ``overlay_mask`` accepts natively),
+    for a quarter of the bytes.
+    """
+    slim: list[dict[str, Any]] = []
+    for vehicle in vehicles:
+        entry: dict[str, Any] = {
+            "bbox": vehicle.get("bbox"),
+            "vehicle_type": vehicle.get("vehicle_type"),
+            "confidence": vehicle.get("confidence"),
+            "smoke": None,
+        }
+        smoke = vehicle.get("smoke")
+        if isinstance(smoke, Mapping):
+            mask = smoke.get("mask")
+            entry["smoke"] = {
+                "mask": (
+                    np.clip(np.asarray(mask, dtype=np.float32) * 255.0, 0, 255).astype(np.uint8)
+                    if mask is not None else None
+                ),
+                "roi": smoke.get("roi"),
+                "severity": smoke.get("severity"),
+                "intensity": smoke.get("intensity"),
+            }
+        slim.append(entry)
+    return slim
+
+
+def _discard_transient_smoke(
+    records: Sequence[dict[str, Any]],
+    shortlist: Sequence[tuple[Any, ...]],
+    out_root: Path,
+) -> int:
+    """Strip smoke from a run no tracked vehicle sustained it on.
+
+    The per-ROI responses were real measurements, but the media-level rule
+    (see the ``MIN_SMOKE_TRACK_*`` block) has judged them transient, so the
+    run reports no smoke.  Everything downstream is kept consistent with that
+    single decision rather than each consumer re-deriving it:
+
+    * the vehicle records lose their ``smoke`` mapping, so ``total_smoke``,
+      ``severity_counts`` and ``overall_severity`` agree, and
+      :func:`analysis.worker._persist` -- which recomputes the counts from
+      these records but takes ``overall_severity`` from the pipeline -- cannot
+      end up logging a spurious disagreement;
+    * the shortlisted frames lose their overlays, so the preview a user sees
+      does not show a plume the summary denies;
+    * the orphaned mask PNGs are unlinked.  Their vehicle crops are kept:
+      a crop is a picture of a vehicle and stays valid either way.
+
+    Returns:
+        How many regions were discarded.
+    """
+    discarded = 0
+    for record in records:
+        smoke = record.get("smoke")
+        if not isinstance(smoke, Mapping):
+            continue
+        discarded += 1
+        record["smoke"] = None
+        mask_path = smoke.get("mask_path")
+        if not mask_path:
+            continue
+        try:
+            (out_root / str(mask_path)).unlink()
+        except OSError as exc:
+            logger.warning("Could not remove discarded smoke mask %s: %s", mask_path, exc)
+
+    for entry in shortlist:
+        for vehicle in entry[4]:
+            vehicle["smoke"] = None
+    return discarded
 
 
 class _ArtifactBudget:
