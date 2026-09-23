@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from .config import DEFAULT_SEGMENTER_WEIGHTS, MLConfig, device_string, get_device
-from .model import SmokeUNet
+from .model import build_arch, count_parameters
 
 logger = logging.getLogger("asg.ml")
 
@@ -70,7 +70,7 @@ class SmokeSegmenter:
         self.device = get_device(self.config.device)
         self.input_size = int(self.config.input_size or 256)
         self.mode: str = "classical"
-        self._net: SmokeUNet | None = None
+        self._net: torch.nn.Module | None = None
         self._loaded = False
         self._checkpoint_meta: dict[str, Any] = {}
 
@@ -93,7 +93,7 @@ class SmokeSegmenter:
         self._ensure_net()
         return dict(self._checkpoint_meta)
 
-    def _ensure_net(self) -> SmokeUNet | None:
+    def _ensure_net(self) -> torch.nn.Module | None:
         if self._loaded:
             return self._net
         self._loaded = True
@@ -113,7 +113,7 @@ class SmokeSegmenter:
         self.mode = "unet" if net is not None else "classical"
         return self._net
 
-    def _load_checkpoint(self) -> tuple[SmokeUNet | None, dict[str, Any]]:
+    def _load_checkpoint(self) -> tuple[torch.nn.Module | None, dict[str, Any]]:
         path = Path(self.weights)
         if not path.is_file():
             logger.warning(
@@ -153,18 +153,33 @@ class SmokeSegmenter:
             )
             return None, {}
 
+        # The checkpoint names its own architecture.
+        #
+        # ``arch`` was added when the ResNet-encoder U-Net arrived; checkpoints
+        # written before that carry ``arch="SmokeUNet"`` or no ``arch`` key at
+        # all, and ``build_arch`` treats both as SmokeUNet -- so every existing
+        # checkpoint, including the shipped ``smoke_unet.pt``, keeps loading
+        # byte-for-byte as before.  A checkpoint naming an architecture this
+        # build does not have raises, is caught below, and degrades to the
+        # classical fallback with a log line rather than a 500.
+        #
+        # ``pretrained`` is deliberately absent: the state dict restores every
+        # encoder weight, so loading never reaches the network or the torch hub
+        # cache.  A server with no outbound access loads this fine.
         try:
             if isinstance(blob, dict) and "state_dict" in blob:
                 state = blob["state_dict"]
                 base = int(blob.get("base", 16))
+                arch = str(blob.get("arch") or "SmokeUNet")
                 meta = {k: v for k, v in blob.items() if k != "state_dict"}
                 if blob.get("input_size"):
                     self.input_size = int(blob["input_size"])
             else:
                 state = blob
                 base = 16
+                arch = "SmokeUNet"
                 meta = {}
-            net = SmokeUNet(in_ch=3, base=base)
+            net = build_arch(arch, base=base, pretrained=False)
             net.load_state_dict(state)
             net.eval()
             net.to(self.device)
@@ -173,10 +188,11 @@ class SmokeSegmenter:
             return None, {}
 
         logger.info(
-            "Loaded SmokeUNet checkpoint %s (base=%s, %s params) on %s.",
+            "Loaded %s checkpoint %s (base=%s, %s params) on %s.",
+            arch,
             path.name,
             base,
-            f"{net.count_parameters():,}",
+            f"{count_parameters(net):,}",
             device_string(self.device),
         )
         return net, meta
@@ -284,7 +300,7 @@ class SmokeSegmenter:
         mask = np.clip(mask.astype(np.float32), 0.0, 1.0)
         return mask, _mask_confidence(mask, float(self.config.mask_threshold))
 
-    def _segment_unet(self, net: SmokeUNet, roi_bgr: np.ndarray) -> tuple[np.ndarray, float]:
+    def _segment_unet(self, net: torch.nn.Module, roi_bgr: np.ndarray) -> tuple[np.ndarray, float]:
         tensor = self._to_tensor(roi_bgr)[None].to(self.device)
         with torch.inference_mode():
             prob = torch.sigmoid(net(tensor))[0, 0].float().cpu().numpy()
