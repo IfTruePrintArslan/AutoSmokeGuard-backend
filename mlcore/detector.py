@@ -33,6 +33,23 @@ EXHAUST_BAND_FRACTION = 0.45
 #: How far the exhaust ROI is grown sideways, as a fraction of vehicle width.
 EXHAUST_SIDE_EXPANSION = 0.30
 #: How far the exhaust ROI is grown downward, as a fraction of the band height.
+#: REVERTED from 1.00 to 0.30 (see measurement notes below). On the annotated
+#: PoVSSeg test set (150 images, 138 with YOLO detections), raising to 1.00
+#: improved median smoke coverage from 27.1% to 94.9% and density (coverage /
+#: ROI area) from 4.29 to 10.25, both peaking at 1.00 across the range 0.30-1.50.
+#: An upward-expansion term was measured and rejected: 81-93% of annotated smoke
+#: lies below the vehicle box, trucks/buses show less above the roofline than
+#: cars, and this is a ground-level plume, not a roof stack.
+#:
+#: BLOCKER: The PoVSSeg test set contains only images with smoke present, so it
+#: cannot measure false positives. When 1.00 was applied to the live pipeline on
+#: clean vehicles, sample_car_clean.mp4 regressed from 0/49 to 24/49 false smoke
+#: detections (0% to 49%, against a 10% tolerance), failing selftest.
+#: sample_truck_smoking.mp4 also fell from 29 confirmed regions to 23. The root
+#: cause is segmenter precision (~0.15 on small plumes): a larger crop mostly adds
+#: road surface for the model to over-paint. Re-apply 1.00 only after segmenter
+#: precision is fixed, and re-measure false positives on clean vehicles at the
+#: same time (not coverage alone).
 EXHAUST_DOWN_EXPANSION = 0.30
 
 # Ultralytics is slow to construct and holds GPU state, so one instance per
