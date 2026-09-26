@@ -191,6 +191,21 @@ train/eval relationship is unverified rather than confirmed-independent.
 Treat a pass/fail on any of these six as "the model behaves sanely on real
 footage," not as "this reproduces the round-2 eval score."
 
+## ⚠️ Hard-negative mining: contamination warning (as of 2026-09-26)
+
+**`sample_street_clean_real.jpg` is a frame of `N_pexels_highway_city`, which is one of six clips mined for hard negatives.** As of 2026-09-26, the six mined clips are:
+
+- `N_pexels_highway_city` ✓ (→ `sample_street_clean_real.jpg`)
+- `N_pexels_mumbai_street`
+- `N_pexels_india_traffic`
+- `N_pexels_cars_road`
+- `N_pexels_trafficjam`
+- `N_pexels_road_traffic`
+
+**For any model trained with these mined negatives, `sample_street_clean_real.jpg` is training data, and a pass on it proves nothing about generalisation.** This fixture remains valid for the shipped `smoke_unet.pt`, which predates the mining and was never trained on these clips. The other five fixtures' source clips (`A_pexels_jaguar_white_exhaust`, `A_pexels_dodge_coldstart`, `B_commons_f450_stacks`, `C_pexels_motorbike_exhaust`) are confirmed **not** in the mined set and remain valid for all models.
+
+**Exception: `sample_car_clean_real.mp4` is safe.** It comes from `NC_pexels_tailpipe_black_car`, which is a held-out close-up **not** in the mined set. This is the only clean fixture genuinely independent of mining work and is currently the most informative clean fixture we have.
+
 ## Apparent vehicle width per positive fixture (is each one a fair test?)
 
 Round-2 recall by apparent vehicle width, from
