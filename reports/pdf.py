@@ -19,11 +19,27 @@ caller.
 
 Visual language mirrors the product UI (ink ``#0a0a0a``, rule ``#d4d4d4``,
 muted text ``#6f6f6f``, and the shared low/moderate/high severity palette) so
-the PDF reads as part of the same product rather than a generic export.  Two
-built-in fonts only (Helvetica / Helvetica-Bold, plus the oblique variant for
-the disclaimer): the product's real webfont ships as ``.woff2``, which
-``reportlab`` cannot embed, so the report leans on layout, colour and spacing
-to carry the brand instead of a matching typeface.
+the PDF reads as part of the same product rather than a generic export. Fixed
+chrome (headings, table headers, the disclaimer) uses the built-in Helvetica
+faces (regular / bold / oblique): the product's real webfont ships as
+``.woff2``, which ``reportlab`` cannot embed, so the report leans on layout,
+colour and spacing to carry the brand instead of a matching typeface.
+
+User-supplied free text is different, and Helvetica cannot be used for it.
+Helvetica/WinAnsi covers Latin-1 only, so any of the three genuinely
+user-supplied fields this report shows -- the source filename and the
+analyst's name/email -- would silently render as ``.notdef`` boxes the moment
+it contained CJK, Cyrillic, emoji, or Arabic/Urdu script. The last of those is
+not a contrived case: this is a Pakistani product, and an uploaded file named
+in Urdu is a realistic input. Those three fields are therefore set in an
+embedded Unicode TrueType font instead -- DejaVu Sans / DejaVu Sans Bold,
+vendored at ``reports/fonts/`` under the permissive Bitstream Vera licence
+(``reports/fonts/LICENSE_DEJAVU.txt``) -- so they render correctly on any
+machine, independent of whatever fonts happen to be installed on the server.
+DejaVu's own coverage stops short of CJK ideographs and most complex emoji;
+any character the embedded font cannot show is swapped for a visible
+``�`` marker (never a silent ``.notdef`` box) and logged by name of the
+field it came from -- see :func:`_prepare_unicode_text`.
 """
 import logging
 import os
@@ -42,6 +58,8 @@ from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas as pdfcanvas
 from reportlab.platypus import (
     HRFlowable,
@@ -56,6 +74,85 @@ from reportlab.platypus import (
 from common.storage import analysis_artifact_dir, from_media_relative
 
 logger = logging.getLogger('asg.reports')
+
+# ---------------------------------------------------------------------------
+# Embedded Unicode font (Fix: non-Latin-1 free text rendering as ``.notdef``
+# boxes) -- see the module docstring for the "why".
+# ---------------------------------------------------------------------------
+
+#: Vendored alongside this module rather than imported from whatever happens
+#: to be installed (e.g. matplotlib's bundled copy, pulled in transitively by
+#: ultralytics) so report rendering keeps working even if that package is
+#: ever dropped, upgraded, or its internal data layout changes.
+_FONT_DIR = Path(__file__).resolve().parent / 'fonts'
+
+#: Registered names for the two faces user-supplied text is set in.
+UNICODE_FONT = 'DejaVuSans'
+UNICODE_FONT_BOLD = 'DejaVuSans-Bold'
+
+#: Character shown in place of any codepoint the embedded font cannot draw
+#: (see :func:`_prepare_unicode_text`) -- visible corruption, signalling that
+#: something was lost, rather than an unreadable ``.notdef`` box that reads as
+#: "this rendered fine."
+_UNSUPPORTED_CHAR_MARKER = '�'
+
+
+def _register_unicode_fonts():
+    """
+    Register the embedded DejaVu Sans faces with ``reportlab``, once per
+    process.
+
+    Idempotent on purpose: this module can be imported more than once under
+    the test runner / autoreload, and there is no reason to re-parse a ~700kB
+    TTF on every call.
+    """
+    if UNICODE_FONT in pdfmetrics.getRegisteredFontNames():
+        return
+    pdfmetrics.registerFont(TTFont(UNICODE_FONT, str(_FONT_DIR / 'DejaVuSans.ttf')))
+    pdfmetrics.registerFont(TTFont(UNICODE_FONT_BOLD, str(_FONT_DIR / 'DejaVuSans-Bold.ttf')))
+    pdfmetrics.registerFontFamily(
+        UNICODE_FONT, normal=UNICODE_FONT, bold=UNICODE_FONT_BOLD,
+        italic=UNICODE_FONT, boldItalic=UNICODE_FONT_BOLD,
+    )
+
+
+_register_unicode_fonts()
+
+
+def _unsupported_chars(text, fontname):
+    """The subset of characters in *text* the registered font *fontname* has no glyph for."""
+    glyphs = pdfmetrics.getFont(fontname).face.charToGlyph
+    return sorted({ch for ch in text if ord(ch) not in glyphs})
+
+
+def _prepare_unicode_text(text, field_name, fontname=UNICODE_FONT):
+    """
+    Coerce *text* to ``str`` and make it safe to draw in *fontname*.
+
+    Every character the font has no glyph for is replaced with a visible
+    ``�`` marker -- degrading loudly, never a silent ``.notdef`` box --
+    and a single warning naming *field_name* and the exact characters lost is
+    logged. DejaVu Sans covers Latin-1/Latin Extended, Cyrillic, Greek,
+    Hebrew and the core Arabic block (so plain-language Arabic/Urdu survives,
+    which is the case this fix exists for) but not CJK ideographs or most
+    complex emoji -- those are the realistic cases this fallback covers.
+    """
+    text = str(text) if text is not None else ''
+    if not text:
+        return text
+    bad = _unsupported_chars(text, fontname)
+    if not bad:
+        return text
+    logger.warning(
+        "Field %s contains %d character(s) unsupported by the embedded "
+        "report font %r; rendering them as %r: %r",
+        field_name, len(bad), fontname, _UNSUPPORTED_CHAR_MARKER, ''.join(bad),
+    )
+    unsupported = set(bad)
+    return ''.join(
+        ch if ch not in unsupported else _UNSUPPORTED_CHAR_MARKER for ch in text
+    )
+
 
 #: Filesystem mode the finished PDF is published with. Mirrors Django's
 #: ``FILE_UPLOAD_PERMISSIONS`` (default ``0o644``) so a report sits under
@@ -75,6 +172,11 @@ MUTED = colors.HexColor('#6f6f6f')
 PANEL_BG = colors.HexColor('#fafafa')
 ZEBRA_BG = colors.HexColor('#f5f5f5')
 CHIP_NEUTRAL = colors.HexColor('#e5e5e5')
+#: Border/text colour for a chip whose severity value is *unrecognised*
+#: junk -- deliberately not a colour from SEVERITY_COLORS or CHIP_NEUTRAL, so
+#: it cannot be mistaken for a real severity band or for the "no smoke" N/A
+#: chip (see _chip_drawing).
+CHIP_UNKNOWN_ACCENT = colors.HexColor('#dc2626')
 
 SEVERITY_COLORS = {
     'low': colors.HexColor('#4ade80'),
@@ -82,6 +184,13 @@ SEVERITY_COLORS = {
     'high': colors.HexColor('#f87171'),
 }
 SEVERITY_ORDER = {'low': 1, 'moderate': 2, 'high': 3}
+#: `''`/`None` and the pipeline's internal `'none'` sentinel are the same
+#: user-facing concept -- "no smoke detected" -- and must render identically
+#: (see _chip_drawing). Duplicating the literal `'none'` here rather than
+#: importing analysis.models keeps this module's only ORM-layer dependency
+#: the already-established one on analysis.models proper, not a sentinel
+#: string owned by the pipeline (mlcore/pipeline.py, analysis/worker.py).
+_CHIP_NONE_VALUES = frozenset({'', 'none'})
 
 PAGE_SIZE = A4
 MARGIN = 18 * mm
@@ -115,9 +224,17 @@ def _esc(text):
     return _xml_escape(str(text if text is not None else ''))
 
 
-def _truncate(text, limit=52):
-    """Truncate long filenames with an ellipsis rather than overflow a cell."""
-    text = text or ''
+def _truncate(text, limit=52, field_name='filename', fontname=UNICODE_FONT_BOLD):
+    """
+    Truncate long filenames with an ellipsis rather than overflow a cell.
+
+    Sanitised through :func:`_prepare_unicode_text` first, against
+    *fontname* -- the font this value is actually drawn in (see
+    ``kv_value_unicode`` in :func:`_styles`) -- so any character the
+    embedded font cannot show becomes a visible marker rather than a silent
+    ``.notdef`` box, before the length-based truncation below ever runs.
+    """
+    text = _prepare_unicode_text(text, field_name, fontname=fontname)
     if len(text) <= limit:
         return _esc(text)
     return _esc(text[:max(0, limit - 1)] + '…')
@@ -179,12 +296,24 @@ def _styles():
             'meta', fontName='Helvetica', fontSize=9,
             textColor=MUTED, leading=12.5,
         ),
+        #: Same as 'meta', but in the embedded Unicode font -- for the one
+        #: line built from user-supplied text (the analyst's name/email).
+        'meta_unicode': ParagraphStyle(
+            'meta_unicode', fontName=UNICODE_FONT, fontSize=9,
+            textColor=MUTED, leading=12.5,
+        ),
         'kv_label': ParagraphStyle(
             'kv_label', fontName='Helvetica', fontSize=8.5,
             textColor=MUTED, leading=11,
         ),
         'kv_value': ParagraphStyle(
             'kv_value', fontName='Helvetica-Bold', fontSize=9.5,
+            textColor=INK, leading=12,
+        ),
+        #: Same as 'kv_value', but in the embedded Unicode font -- for the
+        #: one cell built from user-supplied text (the source filename).
+        'kv_value_unicode': ParagraphStyle(
+            'kv_value_unicode', fontName=UNICODE_FONT_BOLD, fontSize=9.5,
             textColor=INK, leading=12,
         ),
         'body': ParagraphStyle(
@@ -223,18 +352,46 @@ def _styles():
 # ---------------------------------------------------------------------------
 
 def _chip_drawing(severity, width=28 * mm, height=6 * mm, font_size=8):
-    """A rounded severity "chip", in the product's palette."""
-    fill = SEVERITY_COLORS.get(severity, CHIP_NEUTRAL)
-    label = severity.upper() if severity else 'N/A'
+    """
+    A rounded severity "chip", in the product's palette.
+
+    *severity* is expected to be one of ``'low'`` / ``'moderate'`` /
+    ``'high'``, or a value meaning "no smoke": ``None``, ``''`` or the
+    pipeline's internal ``'none'`` sentinel (``AnalysisResult
+    .overall_severity`` genuinely stores that literal string -- see
+    ``mlcore/pipeline.py`` / ``analysis/worker.py`` -- distinct from ``''``
+    at the database level, though not to a reader of this report). All three
+    "no smoke" spellings render identically as the existing neutral ``N/A``
+    chip.
+
+    Any *other* value is not a real severity band. Rendering it with
+    ``.upper()`` in the same neutral style as the ``N/A`` case would dress up
+    a bad value as a legitimate result the reader could mistake for "no
+    smoke" or for a fourth severity; instead it renders in a visibly
+    distinct "unknown" style (dashed red outline, no fill) and is logged, so
+    a bad value is caught rather than silently legitimised.
+    """
+    if severity is None or severity in _CHIP_NONE_VALUES:
+        fill, stroke, label, text_color = CHIP_NEUTRAL, None, 'N/A', INK
+    elif severity in SEVERITY_COLORS:
+        fill, stroke, label, text_color = SEVERITY_COLORS[severity], None, severity.upper(), INK
+    else:
+        logger.warning(
+            'Unrecognised severity value %r passed to the report chip '
+            'renderer; rendering as "unknown" rather than a severity band.',
+            severity,
+        )
+        fill, stroke, label, text_color = None, CHIP_UNKNOWN_ACCENT, 'UNKNOWN', CHIP_UNKNOWN_ACCENT
+
     drawing = Drawing(width, height)
-    drawing.add(Rect(
-        0, 0, width, height, rx=height / 2, ry=height / 2,
-        fillColor=fill, strokeColor=None,
-    ))
+    rect_kwargs = dict(rx=height / 2, ry=height / 2, fillColor=fill, strokeColor=stroke)
+    if stroke is not None:
+        rect_kwargs.update(strokeWidth=0.9, strokeDashArray=[2, 1.5])
+    drawing.add(Rect(0, 0, width, height, **rect_kwargs))
     drawing.add(String(
         width / 2, height / 2 - font_size * 0.35, label,
-        fontName='Helvetica-Bold', fontSize=font_size,
-        fillColor=INK, textAnchor='middle',
+        fontName='Helvetica-Bold', fontSize=min(font_size, 6.5) if stroke is not None else font_size,
+        fillColor=text_color, textAnchor='middle',
     ))
     return drawing
 
@@ -318,8 +475,16 @@ def _cover_thumbnail(analysis, max_width=42 * mm):
 def _cover_section(analysis, report_id, generated_at):
     styles = _styles()
     user = analysis.user
-    analyst_name = _esc(user.full_name or user.email)
-    analyst_email = _esc(user.email)
+    # Both fields are user-supplied free text -- sanitised against, and drawn
+    # in, the embedded Unicode font (see 'meta_unicode' in _styles()) rather
+    # than Helvetica, which would silently render non-Latin-1 characters as
+    # ``.notdef`` boxes.
+    analyst_name = _esc(_prepare_unicode_text(
+        user.full_name or user.email, 'analyst name', fontname=UNICODE_FONT,
+    ))
+    analyst_email = _esc(_prepare_unicode_text(
+        user.email, 'analyst email', fontname=UNICODE_FONT,
+    ))
 
     left = [
         Paragraph('AUTOSMOKEGUARD', styles['wordmark']),
@@ -327,7 +492,7 @@ def _cover_section(analysis, report_id, generated_at):
         Spacer(1, 2.5 * mm),
         Paragraph(f'Report ID: {_esc(str(report_id)[:8])}', styles['meta']),
         Paragraph(f'Generated: {_esc(_fmt_dt(generated_at))}', styles['meta']),
-        Paragraph(f'Analyst: {analyst_name} &lt;{analyst_email}&gt;', styles['meta']),
+        Paragraph(f'Analyst: {analyst_name} &lt;{analyst_email}&gt;', styles['meta_unicode']),
     ]
 
     right = [_chip_drawing(analysis.overall_severity or None, width=32 * mm, height=8 * mm, font_size=9.5)]
@@ -355,27 +520,30 @@ def _summary_section(analysis, media):
     elapsed = analysis.duration_seconds
 
     pairs = [
-        ('Source file', _truncate(media.filename)),
-        ('Media type', _esc((media.media_type or '').title() or '—')),
-        ('Resolution', resolution),
-        ('Duration', duration),
-        ('Uploaded', _esc(_fmt_dt(media.upload_timestamp))),
-        ('Analysis started', _esc(_fmt_dt(analysis.start_time))),
-        ('Analysis ended', _esc(_fmt_dt(analysis.end_time))),
-        ('Elapsed', _esc(_fmt_seconds(elapsed) if elapsed is not None else '—')),
-        ('Frames processed', str(analysis.frames_processed)),
-        ('Total vehicles', str(analysis.total_vehicles)),
-        ('Total smoke regions', str(analysis.total_smoke)),
-        ('Avg. confidence', _fmt_pct(analysis.avg_confidence)),
+        # 'Source file' is the one user-supplied value here (an uploaded
+        # filename), so it alone is drawn in the embedded Unicode font
+        # rather than plain 'kv_value' -- see _truncate().
+        ('Source file', _truncate(media.filename), 'kv_value_unicode'),
+        ('Media type', _esc((media.media_type or '').title() or '—'), 'kv_value'),
+        ('Resolution', resolution, 'kv_value'),
+        ('Duration', duration, 'kv_value'),
+        ('Uploaded', _esc(_fmt_dt(media.upload_timestamp)), 'kv_value'),
+        ('Analysis started', _esc(_fmt_dt(analysis.start_time)), 'kv_value'),
+        ('Analysis ended', _esc(_fmt_dt(analysis.end_time)), 'kv_value'),
+        ('Elapsed', _esc(_fmt_seconds(elapsed) if elapsed is not None else '—'), 'kv_value'),
+        ('Frames processed', str(analysis.frames_processed), 'kv_value'),
+        ('Total vehicles', str(analysis.total_vehicles), 'kv_value'),
+        ('Total smoke regions', str(analysis.total_smoke), 'kv_value'),
+        ('Avg. confidence', _fmt_pct(analysis.avg_confidence), 'kv_value'),
     ]
 
     rows = []
     for i in range(0, len(pairs), 2):
         chunk = pairs[i:i + 2]
         row = []
-        for label, value in chunk:
+        for label, value, value_style in chunk:
             row.append(Paragraph(label, styles['kv_label']))
-            row.append(Paragraph(str(value), styles['kv_value']))
+            row.append(Paragraph(str(value), styles[value_style]))
         if len(chunk) == 1:
             row.extend(['', ''])
         rows.append(row)

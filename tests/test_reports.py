@@ -10,8 +10,11 @@ project's TC ids where the task brief assigns one (``TC-10``..``TC-13``); the
 rest cover force-regeneration semantics, ownership, edge cases and the UC-07
 30-second NFR.
 """
+import base64
+import re
 import time
 import uuid
+import zlib
 from pathlib import Path
 
 import pytest
@@ -45,6 +48,155 @@ LIST_URL = '/api/reports'
 
 VEHICLE_TYPES = ('car', 'truck', 'bus', 'motorcycle')
 SEVERITIES = ('low', 'moderate', 'high')
+
+
+# ---------------------------------------------------------------------------
+# A minimal, dependency-free PDF text extractor.
+#
+# The rest of this file's own words are "no pypdf installed, so this asserts
+# on raw bytes" (see TestPdfStructure below) -- true, and still the reason
+# every other test here never looks past page/byte counts. Proving that a
+# *character* survives the renderer needs more than that, and pulling in a
+# PDF-parsing dependency just for a test is not a reason to change what
+# reports/pdf.py takes as a hard runtime dependency.
+#
+# So this walks exactly what ``reportlab`` is observed to emit: objects
+# delimited by ``obj``/``endobj``, streams filtered through some combination
+# of ``/ASCII85Decode`` and ``/FlateDecode`` (both handled by the stdlib --
+# ``base64``/``zlib``), literal strings on ``Tj``/``TJ`` operators, and two
+# kinds of font: the built-in Helvetica/Times faces (``/WinAnsiEncoding``,
+# decodable with the stdlib ``cp1252`` codec, which is a superset-compatible
+# match) and the embedded DejaVu TrueType faces (an explicit ``/ToUnicode``
+# CMap, parsed directly off its ``beginbfchar``/``endbfchar`` pairs -- the
+# same mechanism a real PDF viewer's "copy text" or a tool like ``pdftotext``
+# ultimately relies on). It is not a general PDF parser and does not need to
+# be: it only has to read back what this one module writes.
+# ---------------------------------------------------------------------------
+
+_PDF_OBJECT_RE = re.compile(rb'(\d+)\s+0\s+obj(.*?)endobj', re.S)
+_FONT_NAME_RE = re.compile(rb'/Name\s*/([A-Za-z0-9+]+)')
+_TOUNICODE_REF_RE = re.compile(rb'/ToUnicode\s+(\d+)\s+0\s+R')
+_BFCHAR_RE = re.compile(rb'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>')
+_TEXT_TOKEN_RE = re.compile(
+    rb'/(?P<font>[A-Za-z0-9+]+)\s+[-\d.]+\s+Tf'
+    rb'|\((?P<lit>(?:[^()\\]|\\.)*)\)\s*Tj'
+    rb'|\[(?P<arr>(?:[^\[\]]|\\.)*)\]\s*TJ',
+    re.S,
+)
+
+
+def _pdf_split_object(body):
+    """``(header, raw_stream_bytes_or_None)`` for one ``obj ... endobj`` body."""
+    idx = body.find(b'stream')
+    if idx == -1:
+        return body, None
+    header = body[:idx]
+    rest = body[idx + len(b'stream'):]
+    if rest[:2] == b'\r\n':
+        rest = rest[2:]
+    elif rest[:1] == b'\n':
+        rest = rest[1:]
+    end = rest.rfind(b'endstream')
+    return header, (rest[:end] if end != -1 else rest)
+
+
+def _pdf_decode_stream(header, raw):
+    if raw is None:
+        return None
+    raw = raw.rstrip(b'\r\n')
+    if b'ASCII85Decode' in header:
+        if raw.endswith(b'~>'):
+            raw = raw[:-2]
+        try:
+            raw = base64.a85decode(raw, adobe=False)
+        except ValueError:
+            return None
+    if b'FlateDecode' in header:
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            return None
+    return raw
+
+
+def _pdf_decode_literal(lit):
+    """A PDF literal string's bytes (``\\ddd``/``\\n`` etc. escapes undone)."""
+    out = bytearray()
+    i = 0
+    while i < len(lit):
+        byte = lit[i]
+        if byte == 0x5c and i + 1 < len(lit):  # backslash
+            octal = re.match(rb'^[0-7]{1,3}', lit[i + 1:i + 4])
+            if octal:
+                out.append(int(octal.group(0), 8) & 0xFF)
+                i += 1 + len(octal.group(0))
+                continue
+            out.append({0x6e: 0x0a, 0x72: 0x0d, 0x74: 0x09,
+                        0x62: 0x08, 0x66: 0x0c}.get(lit[i + 1], lit[i + 1]))
+            i += 2
+            continue
+        out.append(byte)
+        i += 1
+    return bytes(out)
+
+
+def extract_pdf_text(pdf_bytes):
+    """
+    Reconstruct the visible text of a ``reports.pdf``-generated PDF, in the
+    logical (drawing) order the renderer emitted it -- i.e. *not* re-ordered
+    for right-to-left display the way a viewer would. Good enough to prove a
+    value survived the renderer; see the section banner above for scope.
+    """
+    objects = {}
+    for match in _PDF_OBJECT_RE.finditer(pdf_bytes):
+        header, raw = _pdf_split_object(match.group(2))
+        objects[int(match.group(1))] = (header, _pdf_decode_stream(header, raw))
+
+    font_tables = {}
+    for header, dec in objects.values():
+        if b'/Type /Font' not in header and b'/Type/Font' not in header:
+            continue
+        name_match = _FONT_NAME_RE.search(header)
+        if not name_match:
+            continue
+        name = name_match.group(1).decode('ascii')
+        touc_match = _TOUNICODE_REF_RE.search(header)
+        if touc_match:
+            cmap_bytes = objects.get(int(touc_match.group(1)), (None, None))[1]
+            table = {}
+            if cmap_bytes:
+                for code_hex, uni_hex in _BFCHAR_RE.findall(cmap_bytes):
+                    codepoint = int(uni_hex, 16)
+                    if codepoint:
+                        table[int(code_hex, 16)] = codepoint
+            font_tables[name] = table
+        elif b'WinAnsiEncoding' in header:
+            font_tables[name] = {
+                code: ord(bytes([code]).decode('cp1252', errors='replace'))
+                for code in range(256)
+            }
+
+    chars = []
+    for _num, (_header, dec) in sorted(objects.items()):  # deterministic order
+        if dec is None or b'Tf' not in dec or (b'Tj' not in dec and b'TJ' not in dec):
+            continue
+        current_font = None
+        for token in _TEXT_TOKEN_RE.finditer(dec):
+            if token.group('font') is not None:
+                current_font = token.group('font').decode('ascii')
+                continue
+            table = font_tables.get(current_font, {})
+            literals = (
+                [token.group('lit')] if token.group('lit') is not None else
+                [m.group(0)[1:-1] for m in re.finditer(rb'\((?:[^()\\]|\\.)*\)', token.group('arr'))]
+            )
+            for lit in literals:
+                for byte in _pdf_decode_literal(lit):
+                    codepoint = table.get(byte)
+                    if codepoint:
+                        chars.append(chr(codepoint))
+        chars.append('\n')
+    return ''.join(chars)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +630,132 @@ class TestPdfStructure:
         page_objects = raw.count(b'/Type /Page') - raw.count(b'/Type /Pages')
         assert page_objects == report.page_count
         assert report.page_count > 1  # 60 detection rows must have paginated
+
+
+# ===========================================================================
+# The 200-row detection cap — never exercised by any test above, all of
+# which stay at <=60 vehicles.
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestDetectionRowCap:
+
+    def test_over_200_vehicles_are_capped_with_a_correct_remainder_message(self, auth_client):
+        analysis = _make_analysis(auth_client.user)
+        _populate_vehicles(analysis, 215)  # 15 over the MAX_DETECTION_ROWS cap
+
+        report = generate_report_for_analysis(analysis)
+        text = extract_pdf_text(from_media_relative(report.report_path).read_bytes())
+
+        assert '…and 15 more detection(s), not shown.' in text
+        # Exactly one remainder note -- not one per page the table spills onto.
+        assert text.count('not shown.') == 1
+        assert report.page_count > 1
+
+    def test_exactly_200_vehicles_shows_no_remainder_message(self, auth_client):
+        """No-change guard: the cap's edge is '> 200', not '>= 200'."""
+        analysis = _make_analysis(auth_client.user)
+        _populate_vehicles(analysis, 200)
+
+        report = generate_report_for_analysis(analysis)
+        text = extract_pdf_text(from_media_relative(report.report_path).read_bytes())
+
+        assert 'not shown.' not in text
+
+
+# ===========================================================================
+# Fix 1 — non-Latin-1 free text (filename, analyst name/email) must survive
+# the renderer, never render as silent ``.notdef`` boxes.
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestNonLatin1FreeText:
+
+    def test_urdu_filename_and_analyst_name_survive_into_the_pdf(
+            self, user_factory):
+        """
+        The concrete, realistic case the fix exists for: a Pakistani user
+        uploading a file named in Urdu, and an Urdu analyst name. Both are
+        genuinely user-supplied free text (media.filename, user.full_name),
+        drawn in the embedded DejaVu Unicode font -- extracting the PDF's
+        own text proves the characters made it in, not merely that nothing
+        crashed.
+        """
+        user = user_factory(full_name='محمد علی')
+        media = _make_media(user, filename='درخواست فائل.mp4', kind='video')
+        analysis = _make_analysis(user, media=media)
+        _populate_vehicles(analysis, 2)
+
+        report = generate_report_for_analysis(analysis)
+        text = extract_pdf_text(from_media_relative(report.report_path).read_bytes())
+
+        assert 'درخواست فائل.mp4' in text
+        assert 'محمد علی' in text
+        assert '�' not in text  # nothing here was outside the embedded font
+
+    def test_characters_outside_the_embedded_font_become_a_visible_marker(
+            self, auth_client, caplog):
+        """
+        DejaVu Sans's own coverage stops short of CJK ideographs (confirmed
+        with a filename containing 日本語): each such character must become
+        a visible U+FFFD marker -- never a silent ``.notdef`` box -- and the
+        field it came from must be named in a logged warning.
+        """
+        media = _make_media(auth_client.user, filename='日本語.mp4', kind='video')
+        analysis = _make_analysis(auth_client.user, media=media)
+        _populate_vehicles(analysis, 1)
+
+        report = generate_report_for_analysis(analysis)
+        text = extract_pdf_text(from_media_relative(report.report_path).read_bytes())
+
+        assert '���.mp4' in text  # one marker per unsupported character
+        assert '日本語' not in text
+        assert 'filename' in caplog.text
+        assert '日本語' in caplog.text  # the field's actual value is named, not hidden
+
+
+# ===========================================================================
+# Fix 2 — the severity chip must not dress up 'none' or unrecognised junk
+# as a real low/moderate/high severity band.
+# ===========================================================================
+
+@pytest.mark.django_db
+class TestSeverityChipRobustness:
+
+    def test_overall_severity_none_renders_as_na_like_the_empty_case(self, auth_client):
+        """
+        ``AnalysisResult.overall_severity`` genuinely stores the literal
+        string ``'none'`` (the pipeline's internal sentinel for "no smoke
+        detected" -- see mlcore/pipeline.py), distinct from ``''`` at the
+        database level even though both mean the same thing to a reader.
+        Both must render identically as the existing neutral N/A chip, not
+        as a look-alike 'NONE' severity band.
+        """
+        analysis = _make_analysis(auth_client.user, overall_severity='none')
+
+        report = generate_report_for_analysis(analysis)
+        text = extract_pdf_text(from_media_relative(report.report_path).read_bytes())
+
+        assert 'N/A' in text
+        assert 'NONE' not in text
+
+    def test_unrecognised_overall_severity_is_flagged_not_legitimised(
+            self, auth_client, caplog):
+        """
+        Any value outside {'', 'none', 'low', 'moderate', 'high'} is not a
+        real severity band -- rendering it upper-cased in the normal chip
+        style would dress up a bad value (e.g. a typo'd 'critical') as one
+        the reader could mistake for real output. It must render distinctly
+        and be logged instead.
+        """
+        analysis = _make_analysis(auth_client.user, overall_severity='critical')
+
+        report = generate_report_for_analysis(analysis)
+        text = extract_pdf_text(from_media_relative(report.report_path).read_bytes())
+
+        assert 'UNKNOWN' in text
+        assert 'CRITICAL' not in text
+        assert 'critical' in caplog.text
 
 
 # ===========================================================================
