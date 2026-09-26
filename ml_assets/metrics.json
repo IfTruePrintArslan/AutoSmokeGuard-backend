@@ -1,0 +1,168 @@
+{
+  "model": "SmokeUNet",
+  "params": 1964097,
+  "checkpoint": "/Users/arslan/Desktop/FYP/backend/ml_assets/smoke_unet.pt",
+  "trained_at": "2026-09-22T09:27:44+0500",
+  "dataset": {
+    "name": "smoke_synth",
+    "root": "/Users/arslan/Desktop/FYP/backend/ml_assets/datasets/smoke_synth",
+    "generator_version": "2.0.0",
+    "seed": 1337,
+    "val_samples": 700,
+    "totals": {
+      "samples": 3500,
+      "positive": 2337,
+      "negative": 1163
+    },
+    "background_split": {
+      "strategy": "photo-disjoint",
+      "val_fraction": 0.2,
+      "note": "train and val never share a source photograph"
+    }
+  },
+  "device": "mps",
+  "threshold": 0.65,
+  "val": {
+    "iou": 0.640931,
+    "dice": 0.781179,
+    "pixel_accuracy": 0.97251,
+    "precision": 0.824001,
+    "recall": 0.742589,
+    "f1": 0.781179
+  },
+  "val_at_0.5": {
+    "iou": 0.640464,
+    "dice": 0.780833,
+    "pixel_accuracy": 0.971984,
+    "precision": 0.808191,
+    "recall": 0.755267,
+    "f1": 0.780833
+  },
+  "val_dice_per_image": 0.741094,
+  "threshold_sweep": [
+    {
+      "threshold": 0.3,
+      "iou": 0.637625,
+      "dice": 0.778719,
+      "pixel_accuracy": 0.971018,
+      "precision": 0.785823,
+      "recall": 0.771742,
+      "f1": 0.778719
+    },
+    {
+      "threshold": 0.35,
+      "iou": 0.638729,
+      "dice": 0.779542,
+      "pixel_accuracy": 0.971321,
+      "precision": 0.792154,
+      "recall": 0.767325,
+      "f1": 0.779542
+    },
+    {
+      "threshold": 0.4,
+      "iou": 0.639593,
+      "dice": 0.780185,
+      "pixel_accuracy": 0.97158,
+      "precision": 0.797889,
+      "recall": 0.76325,
+      "f1": 0.780185
+    },
+    {
+      "threshold": 0.45,
+      "iou": 0.640104,
+      "dice": 0.780565,
+      "pixel_accuracy": 0.971792,
+      "precision": 0.803128,
+      "recall": 0.759235,
+      "f1": 0.780565
+    },
+    {
+      "threshold": 0.5,
+      "iou": 0.640464,
+      "dice": 0.780833,
+      "pixel_accuracy": 0.971984,
+      "precision": 0.808191,
+      "recall": 0.755267,
+      "f1": 0.780833
+    },
+    {
+      "threshold": 0.55,
+      "iou": 0.640739,
+      "dice": 0.781037,
+      "pixel_accuracy": 0.972166,
+      "precision": 0.813306,
+      "recall": 0.751231,
+      "f1": 0.781037
+    },
+    {
+      "threshold": 0.6,
+      "iou": 0.640898,
+      "dice": 0.781155,
+      "pixel_accuracy": 0.97234,
+      "precision": 0.818503,
+      "recall": 0.747067,
+      "f1": 0.781155
+    },
+    {
+      "threshold": 0.65,
+      "iou": 0.640931,
+      "dice": 0.781179,
+      "pixel_accuracy": 0.97251,
+      "precision": 0.824001,
+      "recall": 0.742589,
+      "f1": 0.781179
+    },
+    {
+      "threshold": 0.7,
+      "iou": 0.6407,
+      "dice": 0.781008,
+      "pixel_accuracy": 0.972669,
+      "precision": 0.829911,
+      "recall": 0.737548,
+      "f1": 0.781008
+    }
+  ],
+  "per_group": {
+    "negative:cast_shadow": {
+      "samples": 76,
+      "pixel_accuracy": 0.993944,
+      "false_positive_rate": 0.006056
+    },
+    "negative:dust": {
+      "samples": 37,
+      "pixel_accuracy": 0.994272,
+      "false_positive_rate": 0.005728
+    },
+    "negative:mined_real": {
+      "samples": 61,
+      "pixel_accuracy": 0.98797,
+      "false_positive_rate": 0.01203
+    },
+    "negative:motion_blur": {
+      "samples": 17,
+      "pixel_accuracy": 0.982479,
+      "false_positive_rate": 0.017521
+    },
+    "negative:plain": {
+      "samples": 21,
+      "pixel_accuracy": 0.984594,
+      "false_positive_rate": 0.015406
+    },
+    "negative:shadow": {
+      "samples": 24,
+      "pixel_accuracy": 0.988675,
+      "false_positive_rate": 0.011325
+    },
+    "positive": {
+      "samples": 464,
+      "pixel_accuracy": 0.963483,
+      "false_positive_rate": 0.012059,
+      "dice": 0.802152,
+      "iou": 0.66966
+    }
+  },
+  "nfr_target": 0.8,
+  "nfr_met": false,
+  "evaluated_at": "2026-09-22T12:30:40+0500",
+  "evaluation_seconds": 6.66
+}

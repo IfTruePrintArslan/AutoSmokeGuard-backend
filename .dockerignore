@@ -1,0 +1,77 @@
+# Build-context excludes for backend/Dockerfile.
+#
+# Getting this right matters a lot here: without it, the build context sent
+# to the Docker daemon would include backend/.venv (~1.2GB), the older
+# backend/venv (~60MB), and ml_assets/datasets/ (263MB of training images)
+# — multiple gigabytes before the image build even starts.
+
+# --- git / CI ----------------------------------------------------------
+.git/
+.github/
+
+# --- Python virtual environments (the image builds its own in /opt/venv) --
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- Django runtime state — regenerated fresh inside the container --------
+db.sqlite3
+db.sqlite3-journal
+# WAL sidecars (SQLite runs in journal_mode=WAL — see config/settings.py) and
+# local test databases, mirroring backend/.gitignore.
+db.sqlite3-wal
+db.sqlite3-shm
+test_db*.sqlite3
+test_db*.sqlite3-wal
+test_db*.sqlite3-shm
+/staticfiles/
+/media/
+/logs/
+# NOTE: this is /media/ (repo-root user-upload storage), NOT the `uploads`
+# Django app (backend/uploads/, application code) — that app is not excluded
+# by anything in this file and is copied normally.
+
+# --- ML assets not needed at runtime --------------------------------------
+# datasets/ (263MB of training images) and runs/ (training-run scratch
+# output) are read only by the offline scripts under mlcore/training/, never
+# by the request-serving path. The *.pt weight files and metrics.json are
+# deliberately NOT excluded here — they ARE required at runtime and are
+# picked up by the Dockerfile's `COPY . .`.
+ml_assets/datasets/
+ml_assets/runs/
+
+# Offline training code — invoked only via `python -m mlcore.training.*`;
+# mlcore/__init__.py does not import this subpackage, so the running server
+# never needs it.
+mlcore/training/
+
+# Sample clips/images used for manual and dev testing only. The verification
+# flow uploads these to the API over HTTP from the host — the running
+# container never needs its own copy on disk.
+sample_media/
+
+# --- tests / coverage -------------------------------------------------------
+tests/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# --- env / secrets -----------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- dev-only docs / tooling not needed by the running container ----------
+# tools/seed.py IS needed (ASG_SEED=1 at start-up), so tools/ as a whole
+# stays — dev_runner.py and make_samples.py just ride along (~120KB).
+scripts/
+
+# --- misc --------------------------------------------------------------
+.DS_Store
+.vscode/
+.idea/
+*.log

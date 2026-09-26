@@ -1,0 +1,24 @@
+# AutoSmokeGuard — production-only backend dependencies
+#
+# Everything the app needs to run *inside a container* that isn't needed for
+# local development (where `manage.py runserver` is the WSGI server and no
+# one installs a production app server on their laptop).
+#
+# `requirements.txt` is owned by another agent and already carries the base
+# web/API/ML stack (including `psycopg[binary]` for PostgreSQL). This file is
+# installed *in addition to* it — see backend/Dockerfile:
+#   pip install -r requirements.txt -r requirements-prod.txt
+#
+# Install:  pip install -r requirements.txt -r requirements-prod.txt
+
+# gunicorn is the WSGI server backend/docker/entrypoint.sh execs into.
+# Threaded worker class (the default sync worker is used here, but with
+# --threads > 1) so a single gunicorn *process* can hold several requests
+# concurrently — required because the ML analysis endpoint can occupy a
+# worker thread for minutes; see the comment in entrypoint.sh for the full
+# reasoning behind --workers/--threads/--timeout.
+gunicorn==23.0.0
+
+# whitenoise is already a base dependency (see requirements.txt) — it serves
+# collected static files (admin CSS, Swagger UI assets) straight from the
+# WSGI app, so no separate static file server is needed in the container.
