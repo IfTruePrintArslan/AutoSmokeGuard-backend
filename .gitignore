@@ -71,3 +71,20 @@ ml_assets/eval_real/
 # Previous model checkpoint (not lost; recoverable from git history via
 # git show f7ed668:ml_assets/smoke_unet.pt > ml_assets/smoke_unet.prev.pt).
 ml_assets/smoke_unet.*.pt
+
+# --- experiment checkpoints (added for licensing/housekeeping pass, 2026-09-27) --
+# Explicit, product-file-safe quarantine for training-experiment checkpoints
+# under ml_assets/, so future retrains don't accidentally get committed.
+# The rule above (ml_assets/smoke_unet.*.pt) already matches every
+# candidate-checkpoint filename found in this tree (they are all named
+# smoke_unet.<suffix>.pt) and does NOT match the three shipped product
+# files below, because none of those three has a second '.' before '.pt'.
+# This block restates that intent as its own explicit, self-documenting
+# rule (harmless overlap with the rule above) and is written broadly
+# enough to also catch differently-prefixed candidate names
+# (yolo11n.candidate*.pt, yolov8n.candidate*.pt), which the rule above
+# would not catch, should those ever appear.
+ml_assets/*candidate*.pt
+!ml_assets/smoke_unet.pt
+!ml_assets/yolo11n.pt
+!ml_assets/yolov8n.pt
